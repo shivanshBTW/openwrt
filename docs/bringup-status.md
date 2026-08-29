@@ -424,6 +424,18 @@ bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie
 SHA256 f5e6e8854f443c7dfff38954d44ba78db3c374fa363bc00b24c77d608366fd45
 ```
 
+The locked R8 UART boot passed on 2026-08-30. Both endpoints again reached
+L0/Gen1; PCIe1 input 57 mapped to Linux IRQ 15 / MIPS GIC hwirq 64, with a zero
+counter while wlan0 remained down. The driver selected the exact OP2200H board
+profile and logged the new board-specific ASPM disable before loading
+`rtl8192fefw.bin`. Sysfs reported `op2200h_allow_tx=N`; wlan0 retained its
+temporary generic Realtek address and no `UP` flag. `gpon-wan-recover` remained
+disabled as intended. R8 is therefore ready for the same controlled
+country/MAC/process preparation followed by a brief managed-interface
+open/close test. The success criterion is that both card-disable markers print
+and `ip link set dev wlan0 down` returns to the shell; no scan, association, AP
+or data traffic is part of that test.
+
 After a UART-observed RAM boot, collect these before trying to load a WiFi
 driver:
 
