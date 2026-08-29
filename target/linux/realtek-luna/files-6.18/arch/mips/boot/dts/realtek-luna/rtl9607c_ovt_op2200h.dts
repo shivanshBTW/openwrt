@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * OVT OP2200H XPON/GPON ONT -- Realtek RTL9607C rev C.
+ *
+ * Milestone 1 is deliberately a RAM-only serial-console image.  The board's
+ * flash geometry is known from the stock kernel, but no flash controller or
+ * partition is described here: an absent MTD device is stronger protection
+ * than a read-only partition flag during first contact.
+ *
+ * Ethernet is also disabled for this milestone.  The current rtl960x_eth
+ * implementation assumes the engineering board's switch topology (five
+ * copper ports, CPU port 9, PON port 5).  The OP2200H port map has not yet
+ * been measured, so allowing that driver to program the switch would violate
+ * the board-porting rule against copying an unverified sibling layout.
+ */
+
+/dts-v1/;
+
+#include "rtl9607c.dtsi"
+
+/ {
+	model = "OVT OP2200H";
+	compatible = "ovt,op2200h", "realtek,rtl9607c", "rtk,8198d";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	/* Confirmed by the OP2200H preloader/U-Boot: 256 MiB DDR3. */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x10000000>;
+	};
+};
+
+&nic {
+	status = "disabled";
+};

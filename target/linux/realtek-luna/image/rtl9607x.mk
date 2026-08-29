@@ -15,6 +15,20 @@ define Device/realtek_rtl9607c
 endef
 TARGET_DEVICES += realtek_rtl9607c
 
+# OVT OP2200H milestone 1: UART + initramfs only.  No KERNEL/IMAGE recipes are
+# declared, so this profile produces no persistent-install artifact.  The DTS
+# deliberately has no NAND node; removing the two write-capable utilities is a
+# second guard against turning a RAM-boot experiment into a flash operation.
+define Device/ovt_op2200h
+  DEVICE_VENDOR := OVT
+  DEVICE_MODEL := OP2200H
+  DEVICE_DTS := rtl9607c_ovt_op2200h
+  DEVICE_DTS_DIR := $(DTS_DIR)/realtek-luna
+  SOC := rtl9607c
+  DEVICE_PACKAGES := -mtd -uboot-envtools
+endef
+TARGET_DEVICES += ovt_op2200h
+
 # LANLY G24W (RTL9603CVD). Same interAptiv MIPS32 R2 core as the RTL9607C
 # above -- MEASURED from the board's own /proc/cpuinfo ("MIPS interAptiv
 # V2.0", isa mips32r2, tlb_entries 64) -- so it belongs in THIS subtarget
