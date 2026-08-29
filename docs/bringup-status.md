@@ -489,6 +489,16 @@ bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie
 SHA256 5212e05234691f0fb5cf9517bf277eb019fcbd2d9af2565c2a9e20af2f6ad82f
 ```
 
+The controlled R10 up/down test passed on 2026-08-30. Every marker through
+`skipping NIC_DISABLE_FLOW`, `before rsv ctrl`, `poweroff adapter done` and
+`complete` printed, `ip link set dev wlan0 down` returned to the shell, and
+the 2.4 GHz LED turned off. Software LED-off was still skipped
+(`unload=0 rfoff=0`); the LED going off is the RF/LPS side-effect, matching
+the R7 observation. This is the first controlled hardware shutdown that did
+not hang. It is still not a scan, association, AP or data-path pass. The
+next check on this same RAM boot is whether a second `wlan0 up`/`down` still
+returns after the skipped CARDDIS, then relock.
+
 ```text
 bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
 SHA256 5212e05234691f0fb5cf9517bf277eb019fcbd2d9af2565c2a9e20af2f6ad82f
