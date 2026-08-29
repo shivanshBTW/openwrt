@@ -528,6 +528,23 @@ bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie
 SHA256 a947296fa1c02abbfc8346ecca13795d686237f0e5cb129b27bf2c3721bb9332
 ```
 
+The locked R11 boot forced pin-based INTx (`phy0 irq=15 (INTx)`). After `wlan0 up`,
+HIMR=`0x200004ff` (ROK and friends enabled), ISR=`0x00100001` (ROK + BCNDMAINT0
+pending), `msi=0`, and `/proc/interrupts` IRQ 15 / MIPS GIC 64 stayed 0. The
+endpoint is raising INTx; GIC shared-xlate hwirq 64 is not that line. Shutdown
+still completed. R12 maps domain hwirq 57 (the R6-delivering number) with
+`IRQ_TYPE_LEVEL_HIGH` so the level handler can ack it. Do not unlock R11 for
+another scan. The build tree compiles `pcie-rtl960x.c`; `pcie-luna.c` is the
+workspace copy of the same driver.
+
+R12 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,240
+bytes and payload 4,279,176 bytes.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 1a746f87f428fd324701a27b943904d9d5deb9772239d9d9a4a767c3f6c0ffa2
+```
+
 ```text
 bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
 SHA256 5212e05234691f0fb5cf9517bf277eb019fcbd2d9af2565c2a9e20af2f6ad82f
