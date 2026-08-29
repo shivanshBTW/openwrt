@@ -133,6 +133,16 @@ static int rtl92fe_init_sw_vars(struct ieee80211_hw *hw)
 	rtlpriv->psc.swctrl_lps = rtlpriv->cfg->mod_params->swctrl_lps;
 	rtlpriv->psc.fwctrl_lps = rtlpriv->cfg->mod_params->fwctrl_lps;
 	rtlpci->msi_support = rtlpriv->cfg->mod_params->msi_support;
+	/* RTL9607C's fixed-window host has no working MSI.  The default
+	 * rtlwifi msi=1 can make pci_enable_msi() succeed against a valid
+	 * GIC virq, set the endpoint MSI enable bit (which suppresses INTx),
+	 * then never deliver a message.  That matches R7+: Linux IRQ 15 is
+	 * registered, /proc count stays 0, while R6's broken mapping still
+	 * saw INTx as unexpected IRQ 57. */
+	if (of_machine_is_compatible("ovt,op2200h")) {
+		rtlpci->msi_support = false;
+		pr_info("rtl8192fe: OP2200H forcing pin-based INTx (no MSI on RTL9607C host)\n");
+	}
 	if (rtlpriv->cfg->mod_params->disable_watchdog)
 		pr_info("watchdog disabled\n");
 	rtlpriv->psc.reg_fwctrl_lps = 3;

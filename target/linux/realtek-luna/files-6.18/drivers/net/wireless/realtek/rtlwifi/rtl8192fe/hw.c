@@ -1848,6 +1848,12 @@ void rtl92fe_enable_interrupt(struct ieee80211_hw *hw)
 	rtl_write_dword(rtlpriv, REG_HIMR, rtlpci->irq_mask[0] & 0xFFFFFFFF);
 	rtl_write_dword(rtlpriv, REG_HIMRE, rtlpci->irq_mask[1] & 0xFFFFFFFF);
 	rtlpci->irq_enabled = true;
+	if (of_machine_is_compatible("ovt,op2200h"))
+		pr_info("rtl8192fe: OP2200H HIMR=0x%08x ISR=0x%08x HIMRE=0x%08x irq=%u msi=%d\n",
+			rtl_read_dword(rtlpriv, REG_HIMR),
+			rtl_read_dword(rtlpriv, ISR),
+			rtl_read_dword(rtlpriv, REG_HIMRE),
+			rtlpci->pdev->irq, rtlpci->using_msi);
 }
 
 void rtl92fe_disable_interrupt(struct ieee80211_hw *hw)

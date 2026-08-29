@@ -512,11 +512,21 @@ IRQ count from that attempt, then a wider passive scan if the console is
 still healthy.
 
 After that scan, `grep rtl /proc/interrupts` was still `15: 0 MIPS GIC 64
-rtl_pci` and the TX gate was `N`. The `rtl_pci` handler has never run on this
-R10 boot, including three RF inits. R6 proved the endpoint can assert INTx;
-empty scan plus a zero count is a delivery/RX-enable question, not “no APs on
-channel 7”. A wider scan is not the next step until IRQ 15 increments while
-`wlan0` is up.
+rtl_pci` and the TX gate was `N`. A follow-up `wlan0 up` still showed IRQ 15
+count 0 while the interface was up; sysfs `0000:02:01.0/irq` is 15; `ERR: 0`.
+The descriptor is registered. The line does not fire. R6 proved INTx can
+assert; R7's GIC xlate stopped the storm but may have done so by leaving the
+endpoint in MSI mode (`msi_support` defaults true) which suppresses INTx on a
+host that never delivers MSI. R11 forces pin-based INTx on OP2200H and logs
+HIMR/ISR and MSI vs INTx at start.
+
+R11 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,797
+bytes and payload 4,279,733 bytes.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 a947296fa1c02abbfc8346ecca13795d686237f0e5cb129b27bf2c3721bb9332
+```
 
 ```text
 bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin

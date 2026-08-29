@@ -2227,6 +2227,9 @@ int rtl_pci_probe(struct pci_dev *pdev,
 			wiphy_name(hw->wiphy));
 		goto fail3;
 	}
+	pr_info("rtl8192fe: %s irq=%u (%s)\n",
+		wiphy_name(hw->wiphy), rtlpci->pdev->irq,
+		rtlpci->using_msi ? "MSI" : "INTx");
 	rtlpci->irq_alloc = 1;
 
 	set_bit(RTL_STATUS_INTERFACE_START, &rtlpriv->status);
