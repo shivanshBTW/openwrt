@@ -430,11 +430,30 @@ counter while wlan0 remained down. The driver selected the exact OP2200H board
 profile and logged the new board-specific ASPM disable before loading
 `rtl8192fefw.bin`. Sysfs reported `op2200h_allow_tx=N`; wlan0 retained its
 temporary generic Realtek address and no `UP` flag. `gpon-wan-recover` remained
-disabled as intended. R8 is therefore ready for the same controlled
-country/MAC/process preparation followed by a brief managed-interface
-open/close test. The success criterion is that both card-disable markers print
-and `ip link set dev wlan0 down` returns to the shell; no scan, association, AP
-or data traffic is part of that test.
+disabled as intended.
+
+The controlled R8 open then matched R7: after country `IN`, the unit MAC and
+an explicit TX unlock, `ip link set dev wlan0 up` returned. RF/PHY reported
+2T2R, RFE type 3, XCAP `0x10`, both paths on channel 7 (`RF_*[0x18]=0x03c07`)
+and populated IQK. IRQ 15 stayed `MIPS GIC 64 rtl_pci` at count 0. `wlan0` was
+administratively `UP` with `NO-CARRIER` / operstate `DOWN`, as expected with no
+scan or association. No scan, AP or data traffic was attempted.
+
+`ip link set dev wlan0 down` hung. UART printed `OP2200H card disable begin`
+(console-duplicated) and then stopped mid-line at `[ 1075.`; `complete` never
+appeared and the 2.4 GHz LED stayed on. R8 therefore did not reach
+`rtl_pci_enable_aspm()`. The stall is inside `rtl92fe_card_disable()` /
+`_rtl92fe_poweroff_adapter()`, and the still-on LED is consistent with never
+finishing the NIC disable flow that deasserts the LED pad (R7's LED-off was
+likely that hardware side-effect, not a completed `rtl_pci_stop()`). Do not
+unlock R8 again.
+
+R9 keeps the default-off TX gate and ASPM disable, and adds staged
+`OP2200H card disable <step>` markers with a 50 ms UART drain after each
+print so a hung BAR access cannot swallow the last completed step. The first
+hardware access after `begin` is `_rtl92fe_set_media_status()` (`MSR` read).
+The NIC disable flow later requests MAC-off and polls `0x05` bit 1; a poll
+timeout cannot save a `rtl_read_byte()` that never returns on this host.
 
 After a UART-observed RAM boot, collect these before trying to load a WiFi
 driver:

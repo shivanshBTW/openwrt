@@ -14,6 +14,7 @@
 #include "dm.h"
 #include "fw.h"
 #include "led.h"
+#include <linux/delay.h>
 #include <linux/of.h>
 #include "hw.h"
 #include "../pwrseqcmd.h"
@@ -37,6 +38,19 @@ MODULE_PARM_DESC(xtal_cap, "RTL8192F crystal load-cap trim 0..0x3f (<0 = use EFU
 static bool op2200h_allow_tx;
 module_param(op2200h_allow_tx, bool, 0600);
 MODULE_PARM_DESC(op2200h_allow_tx, "Permit OP2200H RTL8192F hardware init/transmit (default: false)");
+
+/* R8 hung after "card disable begin" with the 2.4 GHz LED still on, so the
+ * stall is inside rtl92fe_card_disable() / _rtl92fe_poweroff_adapter() and
+ * not the later rtl_pci_enable_aspm() path.  Print a stage name, then delay
+ * so the UART can drain before the next BAR access: a hung MMIO otherwise
+ * cuts off the marker that identified the failing step. */
+static void op2200h_card_disable_mark(const char *step)
+{
+	if (!of_machine_is_compatible("ovt,op2200h"))
+		return;
+	pr_info("rtl8192fe: OP2200H card disable %s\n", step);
+	mdelay(50);
+}
 
 static void _rtl92fe_set_bcn_ctrl_reg(struct ieee80211_hw *hw,
 				      u8 set_bits, u8 clear_bits)
@@ -1857,12 +1871,15 @@ static void _rtl92fe_poweroff_adapter(struct ieee80211_hw *hw)
 	rtl_dbg(rtlpriv, COMP_INIT, DBG_LOUD, "POWER OFF adapter\n");
 
 	/* Run LPS WL RFOFF flow */
+	op2200h_card_disable_mark("before lps enter");
 	rtl_hal_pwrseqcmdparsing(rtlpriv, PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK,
 				 PWR_INTF_PCI_MSK, RTL8192F_NIC_LPS_ENTER_FLOW);
 	/* turn off RF */
+	op2200h_card_disable_mark("before rf ctrl");
 	rtl_write_byte(rtlpriv, REG_RF_CTRL, 0x00);
 
 	/* ==== Reset digital sequence ==== */
+	op2200h_card_disable_mark("before mcu reset");
 	if ((rtl_read_byte(rtlpriv, REG_MCUFWDL) & BIT(7)) && rtlhal->fw_ready)
 		rtl92fe_firmware_selfreset(hw);
 
@@ -1874,10 +1891,12 @@ static void _rtl92fe_poweroff_adapter(struct ieee80211_hw *hw)
 	rtl_write_byte(rtlpriv, REG_MCUFWDL, 0x00);
 
 	/* HW card disable configuration. */
+	op2200h_card_disable_mark("before nic disable flow");
 	rtl_hal_pwrseqcmdparsing(rtlpriv, PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK,
 				 PWR_INTF_PCI_MSK, RTL8192F_NIC_DISABLE_FLOW);
 
 	/* Reset MCU IO Wrapper */
+	op2200h_card_disable_mark("before rsv ctrl");
 	u1b_tmp = rtl_read_byte(rtlpriv, REG_RSV_CTRL + 1);
 	rtl_write_byte(rtlpriv, REG_RSV_CTRL + 1, (u1b_tmp & (~BIT(0))));
 	u1b_tmp = rtl_read_byte(rtlpriv, REG_RSV_CTRL + 1);
@@ -1885,6 +1904,7 @@ static void _rtl92fe_poweroff_adapter(struct ieee80211_hw *hw)
 
 	/* lock ISO/CLK/Power control register */
 	rtl_write_byte(rtlpriv, REG_RSV_CTRL, 0x0E);
+	op2200h_card_disable_mark("poweroff adapter done");
 }
 
 void rtl92fe_card_disable(struct ieee80211_hw *hw)
@@ -1896,20 +1916,29 @@ void rtl92fe_card_disable(struct ieee80211_hw *hw)
 	enum nl80211_iftype opmode;
 
 	rtl_dbg(rtlpriv, COMP_INIT, DBG_LOUD, "RTL8192fe card disable\n");
-	if (op2200h)
-		pr_info("rtl8192fe: OP2200H card disable begin\n");
+	op2200h_card_disable_mark("begin");
 
 	RT_SET_PS_LEVEL(ppsc, RT_RF_OFF_LEVL_HALT_NIC);
 
 	mac->link_state = MAC80211_NOLINK;
 	opmode = NL80211_IFTYPE_UNSPECIFIED;
 
+	op2200h_card_disable_mark("before media status");
 	_rtl92fe_set_media_status(hw, opmode);
+	op2200h_card_disable_mark("after media status");
 
 	if (rtlpriv->rtlhal.driver_is_goingto_unload ||
-	    ppsc->rfoff_reason > RF_CHANGE_BY_PS)
+	    ppsc->rfoff_reason > RF_CHANGE_BY_PS) {
+		op2200h_card_disable_mark("before led power off");
 		rtlpriv->cfg->ops->led_control(hw, LED_CTL_POWER_OFF);
+	} else if (op2200h) {
+		pr_info("rtl8192fe: OP2200H card disable led skipped (unload=%d rfoff=%d)\n",
+			rtlpriv->rtlhal.driver_is_goingto_unload,
+			ppsc->rfoff_reason);
+		mdelay(50);
+	}
 
+	op2200h_card_disable_mark("before poweroff adapter");
 	_rtl92fe_poweroff_adapter(hw);
 
 	/* P3: after power off we must redo IQK. Clear iqk_initialized
@@ -1919,8 +1948,7 @@ void rtl92fe_card_disable(struct ieee80211_hw *hw)
 	 * (which can settle to identity) on a freshly reset baseband. Only a reboot
 	 * re-ran a real IQK. Clearing here makes a reload recalibrate for real. */
 	rtlpriv->phy.iqk_initialized = false;
-	if (op2200h)
-		pr_info("rtl8192fe: OP2200H card disable complete\n");
+	op2200h_card_disable_mark("complete");
 }
 
 void rtl92fe_interrupt_recognized(struct ieee80211_hw *hw,
