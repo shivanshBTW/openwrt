@@ -455,6 +455,23 @@ hardware access after `begin` is `_rtl92fe_set_media_status()` (`MSR` read).
 The NIC disable flow later requests MAC-off and polls `0x05` bit 1; a poll
 timeout cannot save a `rtl_read_byte()` that never returns on this host.
 
+R9 built on 2026-08-30 as a legacy MIPS/LZMA uImage with load/entry
+`0x80000000`, total size 4,280,789 bytes and payload 4,280,725 bytes. The
+linked kernel contains the staged card-disable format string, every step
+name, the TX lock/unlock guards and the ASPM-disable message. R8 is preserved
+separately and must not be radio-unlocked again.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 5212e05234691f0fb5cf9517bf277eb019fcbd2d9af2565c2a9e20af2f6ad82f
+
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-r8-initramfs-kernel.bin
+SHA256 d46edd37d2a3701f2c721a7f20fd8c7a376e2d1d88a63c5519acb3f786815672
+
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-r7-initramfs-kernel.bin
+SHA256 f5e6e8854f443c7dfff38954d44ba78db3c374fa363bc00b24c77d608366fd45
+```
+
 After a UART-observed RAM boot, collect these before trying to load a WiFi
 driver:
 
