@@ -22,7 +22,7 @@ task are recorded in [uart-console.md](uart-console.md).
 | CPU, IRQ, timer, UART | Alpha `realtek-luna` RTL9607C platform | Reuse. Override the reference board's 288 MiB memory with the confirmed 256 MiB. |
 | Clock, GPIO, SPI NAND/ECC | Jameywine RTL9607C platform and BT-G711AX DTS | Reference only. Its flash offsets differ, and milestone 1 declares no flash node. |
 | Ethernet | Alpha `rtl960x_eth.c` | Do not enable yet. It currently assumes CPU port 9, PON port 5, and five copper ports. OP2200H Ethernet/switch mapping is unmeasured. |
-| PCIe | Alpha `pcie-rtl960x.c`; recovered stock RTL9607C implementation | Implemented as two independent hosts behind the OP2200H-only DT safety gate. Test only with the RAM-only `ovt_op2200h_pcie_test` profile until UART confirms both endpoints and resource mappings. |
+| PCIe | Two-host RTL9607C bring-up proven by UART RAM boot | Both Gen1 links and endpoints enumerate with non-overlapping resources. The RTL8192F driver successfully requested GIC input 57 as Linux IRQ 57; GIC56 remains unrequested until an RTL8812FE driver binds. |
 | 2.4 GHz | Alpha clean-room `rtl8192fe` | Reuse after RTL9607C PCIe works. Do not copy X111W calibration; extract OP2200H calibration/MAC data first. |
 | 5 GHz | Jameywine research; Realtek GPL `rtl8192cd` | No current fetched branch contains an `10ec:f812` driver. Locate the experimental rtw88 work or implement it from a reviewable source before enabling the radio. |
 | GPON/OMCI | Alpha shared GPON core plus `rtl9607c_gpon.c` | Defer. Preserve the unit's ONU identity and laser/optics configuration before connecting experimental firmware to the PON. |
@@ -78,22 +78,33 @@ controllers, not one controller multiplexed between two radios:
 | 0 | `10ec:f812` RTL8812FE | `b8b20000` / `b8b21000` / `b8b30000` | `ba000000` (phys `1a000000`) | GIC 56 / Linux 72 | GPIO40 |
 | 1 | `10ec:818c` RTL8192F | `b8b00000` / `b8b01000` / `b8b10000` | `b9000000` (phys `19000000`) | GIC 57 / Linux 73 | GPIO39 |
 
-The stock port-0 SerDes table is:
+The stock port-0 raw SerDes table is:
 
 ```text
 00=8a50 02=26f9 03=6bcd 06=104a 09=6307 0b=0009 0c=0800
 20=0105 21=1000
 ```
 
-The stock port-1 SerDes table is:
+The stock port-1 raw SerDes table is:
 
 ```text
 00=8a50 02=26f9 03=6bcd 04=8049 06=1088 07=52b3 08=5285
 09=6300 0b=0009 0c=0800 0e=0093 20=0105 21=1000
 ```
 
-Both tables are terminated by `ff=ffff`; they are not interchangeable. The
-reset routine also confirms:
+Both raw tables are terminated by `ff=ffff`. They are not, however, the final
+values used on this revision-C board. The stock boot identifies `IC-C v006`,
+and `__pcie_param_fixup()` at `0x807335d0` replaces the port-1 table in memory
+before `PCIE_reset_procedure()` performs its MDIO loop. The effective port-1
+recipe is:
+
+```text
+01=a852 06=0017 08=3591 09=520c 0a=f670 0b=a90d 0d=e720
+0e=1000 1c=2001 1e=66eb 20=d4a4 21=485a 23=0b66 24=4f0c
+29=f0f3 2b=a0a1 09=500c 09=520c
+```
+
+The reset routine also confirms:
 
 - `SOC_IP_SEL` (`0xb8000600`) uses bit 7 for port 0 and bit 6 for port 1;
 - `SOC_PCI_MISC` (`0xb8000504`) gives port 0 its bit-24 reset strobe and port 1
@@ -182,11 +193,11 @@ the RAM-boot artifact below (plus metadata), not a sysupgrade or flash image:
 
 ```text
 bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
-SHA256 47b4dfc2a2dafcb2f5da84a1a433342ffe8e4c3874a33935f3ef2eb34ca76892
+SHA256 de63f6cc6a6440f901eda9d8e0c8c5acec52a732786e8da304c1bb0fc45b1804
 ```
 
 The result is a legacy MIPS/Linux LZMA uImage with load and entry address
-`0x80000000`; its payload is 4,279,240 bytes. Decompressing the payload and
+`0x80000000`; its payload is 4,278,589 bytes. Decompressing the payload and
 comparing its tail against the compiled test DTB confirmed that it embeds
 `rtl9607c_ovt_op2200h_pcie_test.dtb`, including `realtek,enable-pcie`.
 
@@ -207,14 +218,44 @@ through four attempts, so the remaining work is isolated to the GPIO39/port-1
 reset or PHY sequence; do not treat the dual-port implementation as complete
 until `10ec:818c` enumerates independently as well.
 
-The current artifact above is the third, diagnostic RAM-test image. Because the
-initramfs kernel intentionally has no `CONFIG_DEVMEM` and therefore no
+The third RAM-test image added driver diagnostics. Because the initramfs kernel
+intentionally has no `CONFIG_DEVMEM` and therefore no
 `/dev/mem`, the driver now prints a read-only snapshot after each successful or
 timed-out training attempt: the shared GPIO
 pad-enable/direction/data words, decoded PERST# level, PCI reset and IP-gate
 registers, LTSSM control/state, and final PHY-MDIO command. This permits a
 direct comparison between working PCIe0 and failing PCIe1 without enabling an
 arbitrary physical-memory write interface.
+
+That diagnostic boot showed PCIe0 at L0 (`state=11`) with endpoint
+`10ec:f812`. PCIe1 consistently reached only `state=02`, but its snapshot proved
+that GPIO39 was claimed and driven as an output, PERST# was released high, the
+port-1 reset strobe and MAC gate were set, and LTSSM control was `0x81`. This
+ruled out the corrected GPIO mapping and exposed the raw-versus-effective PHY
+table discrepancy above. The current artifact is the fourth RAM-test image and
+changes only PCIe1 to stock's effective revision-C PHY recipe; PCIe0 retains its
+already-proven sequence.
+
+The fourth UART RAM boot completed the dual-host link/resource milestone. PCIe0
+trained at Gen1 and enumerated `10ec:f812` at `0000:00:01.0`, with its 64-bit
+MMIO BAR translated to CPU `0x1a000000-0x1a00ffff`. PCIe1 applied the expected
+final MDIO register (`mdio=00000931`), reached L0 on its first attempt, and
+enumerated `10ec:818c` at `0000:02:01.0`, with MMIO at
+`0x19000000-0x1900ffff`. Both root bridges and their split IO resources
+registered without overlap, and the system reached a stable OpenWrt console.
+The in-tree `rtl8192fe` driver then bound to `10ec:818c`, but correctly warned
+that this unit's factory calibration has not been supplied. Do not transmit
+with generic calibration; IRQ routing and unit-specific calibration are the
+next read-only checks.
+
+The follow-up sysfs/procfs inventory confirmed that `rtl8192fe` owns
+`0000:02:01.0` and requested GIC input 57 as Linux IRQ 57. The IRQ number differs
+from stock's Linux IRQ 73 because the Linux 6.18 GIC domain uses a different
+virtual-IRQ allocation; the hardware input is unchanged. Endpoint `10ec:f812`
+correctly remains at the PCI core's unassigned IRQ value 255 because no
+RTL8812FE driver is present to request GIC input 56. `phy0` exposes the expected
+2.4 GHz HT20/HT40, two-stream MCS set, but its interface is down with a generic
+Realtek MAC and no OP2200H calibration, so it must not transmit yet.
 
 After a UART-observed RAM boot, collect these before trying to load a WiFi
 driver:
@@ -229,10 +270,11 @@ for d in /sys/bus/pci/devices/*; do
 done
 ```
 
-Expected endpoint IDs are `10ec:f812` and `10ec:818c`; expected IRQs are 72 and
-73. Stop after capturing UART if either link retries continuously, a resource
-conflict is reported, the kernel faults, or the board resets. Do not run a
-flash-write command as part of this test.
+Expected endpoint IDs are `10ec:f812` and `10ec:818c`. Hardware interrupt inputs
+are GIC56 and GIC57; Linux virtual IRQ numbers are kernel-domain allocations and
+need not equal stock's 72/73. Stop after capturing UART if either link retries
+continuously, a resource conflict is reported, the kernel faults, or the board
+resets. Do not run a flash-write command as part of this test.
 
 ## Read-only measurements required next
 
