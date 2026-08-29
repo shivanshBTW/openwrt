@@ -151,10 +151,12 @@ static const struct luna_pcie_phy luna_pcie_phy_9603cvd[] = {
 };
 
 /*
- * RTL9607C has two independent PCIe hosts and two different SerDes recipes.
- * These pairs are recovered directly from PCIE_reset_procedure() in the
- * OP2200H's own Linux-4.4.140 image. Do not merge the arrays: port 0's RTL8812FE
- * and port 1's RTL8192F are trained with materially different analog values.
+ * RTL9607C has two independent PCIe hosts.  The port-0 recipe below is the raw
+ * table selected by PCIE_reset_procedure() and is proven to train the OP2200H's
+ * RTL8812FE.  Port 1 is subtler: this revision-C SoC prints "IC-C v006", and
+ * the stock __pcie_param_fixup() at 0x807335d0 replaces its raw 13-pair table
+ * with the effective 18-pair recipe below immediately before the MDIO loop.
+ * Using the unpatched raw table leaves the RTL8192F in LTSSM state 0x2.
  */
 static const struct luna_pcie_phy luna_pcie_phy_9607c_p0[] = {
 	{ 0x00, 0x8a50 }, { 0x02, 0x26f9 }, { 0x03, 0x6bcd }, { 0x06, 0x104a },
@@ -164,10 +166,11 @@ static const struct luna_pcie_phy luna_pcie_phy_9607c_p0[] = {
 };
 
 static const struct luna_pcie_phy luna_pcie_phy_9607c_p1[] = {
-	{ 0x00, 0x8a50 }, { 0x02, 0x26f9 }, { 0x03, 0x6bcd }, { 0x04, 0x8049 },
-	{ 0x06, 0x1088 }, { 0x07, 0x52b3 }, { 0x08, 0x5285 }, { 0x09, 0x6300 },
-	{ 0x0b, 0x0009 }, { 0x0c, 0x0800 }, { 0x0e, 0x0093 }, { 0x20, 0x0105 },
-	{ 0x21, 0x1000 },
+	{ 0x01, 0xa852 }, { 0x06, 0x0017 }, { 0x08, 0x3591 }, { 0x09, 0x520c },
+	{ 0x0a, 0xf670 }, { 0x0b, 0xa90d }, { 0x0d, 0xe720 }, { 0x0e, 0x1000 },
+	{ 0x1c, 0x2001 }, { 0x1e, 0x66eb }, { 0x20, 0xd4a4 }, { 0x21, 0x485a },
+	{ 0x23, 0x0b66 }, { 0x24, 0x4f0c }, { 0x29, 0xf0f3 }, { 0x2b, 0xa0a1 },
+	{ 0x09, 0x500c }, { 0x09, 0x520c },
 	{ 0xff, 0xffff },
 };
 

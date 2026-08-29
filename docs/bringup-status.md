@@ -182,11 +182,11 @@ the RAM-boot artifact below (plus metadata), not a sysupgrade or flash image:
 
 ```text
 bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
-SHA256 6be5dcae8301017380c9efb5e5878481d3bfd75ffe854e2dbce69bb3dbbcea2f
+SHA256 47b4dfc2a2dafcb2f5da84a1a433342ffe8e4c3874a33935f3ef2eb34ca76892
 ```
 
 The result is a legacy MIPS/Linux LZMA uImage with load and entry address
-`0x80000000`; its payload is 4,278,333 bytes. Decompressing the payload and
+`0x80000000`; its payload is 4,279,240 bytes. Decompressing the payload and
 comparing its tail against the compiled test DTB confirmed that it embeds
 `rtl9607c_ovt_op2200h_pcie_test.dtb`, including `realtek,enable-pcie`.
 
@@ -197,8 +197,7 @@ for all four attempts. That result exposed a sibling-layout error in the
 endpoint reset mapping: GPIO39/40 are RTL9607C bank 1, whose SWCORE pad-enable
 word is physical `0x1b00003c`; the initial table incorrectly used
 `0x1b000040`, claiming bank 2 while writing bank-1 direction/data registers.
-The current artifact above contains the corrected bank-1 address and is the
-image for the second UART test.
+The second UART test image contained the corrected bank-1 address.
 
 The second UART RAM boot confirmed that correction: PCIe0 trained at Gen1,
 enumerated root port `10ec:8196` and endpoint `10ec:f812`, translated PCI bus
@@ -207,6 +206,15 @@ console without a panic or reset. PCIe1 still remained in LTSSM state `0x2`
 through four attempts, so the remaining work is isolated to the GPIO39/port-1
 reset or PHY sequence; do not treat the dual-port implementation as complete
 until `10ec:818c` enumerates independently as well.
+
+The current artifact above is the third, diagnostic RAM-test image. Because the
+initramfs kernel intentionally has no `CONFIG_DEVMEM` and therefore no
+`/dev/mem`, the driver now prints a read-only snapshot after each successful or
+timed-out training attempt: the shared GPIO
+pad-enable/direction/data words, decoded PERST# level, PCI reset and IP-gate
+registers, LTSSM control/state, and final PHY-MDIO command. This permits a
+direct comparison between working PCIe0 and failing PCIe1 without enabling an
+arbitrary physical-memory write interface.
 
 After a UART-observed RAM boot, collect these before trying to load a WiFi
 driver:
