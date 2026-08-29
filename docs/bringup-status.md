@@ -504,6 +504,13 @@ back to `N`. IRQ 15 stayed `MIPS GIC 64 rtl_pci` at count 0 (idle, no scan).
 Controlled open/close is repeatable without `NIC_DISABLE_FLOW`. Still no
 scan, association, AP or data traffic.
 
+A later third up on the same boot, then `iw dev wlan0 scan freq 2442 passive`,
+returned an empty BSS list and no Oops. `wlan0 down` still printed `complete`
+and returned. That is a hang-safety pass around scan, not a receiver pass:
+one idle channel and an immediate empty dump do not prove RX. Next is the
+IRQ count from that attempt, then a wider passive scan if the console is
+still healthy.
+
 ```text
 bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
 SHA256 5212e05234691f0fb5cf9517bf277eb019fcbd2d9af2565c2a9e20af2f6ad82f
