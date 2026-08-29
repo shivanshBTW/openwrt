@@ -149,6 +149,42 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  
  static const char *argv_exec_path;
  static const char *argv0_path;
+--- a/usr/gen_init_cpio.c
++++ b/usr/gen_init_cpio.c
+@@ -31,5 +31,23 @@ static int outfd = STDOUT_FILENO;
+ static unsigned int dalign;
+ 
++#ifndef O_LARGEFILE
++#define O_LARGEFILE 0
++#endif
++
++/* copy_file_range() is a Linux-specific optimisation. Keep gen_init_cpio
++ * buildable on other supported OpenWrt hosts and use its read/write fallback. */
++static ssize_t copy_file_range_compat(int fd_in, off_t *off_in,
++				      int fd_out, off_t *off_out,
++				      size_t len, unsigned int flags)
++{
++#ifdef __linux__
++	return copy_file_range(fd_in, off_in, fd_out, off_out, len, flags);
++#else
++	errno = ENOSYS;
++	return -1;
++#endif
++}
++
+ struct file_handler {
+ 	const char *type;
+ 	int (*handler)(const char *line);
+@@ -457,7 +475,8 @@ static int cpio_mkfile(const char *name,
+ 		}
+ 
+ 		if (size) {
+-			this_read = copy_file_range(file, NULL, outfd, NULL, size, 0);
++			this_read = copy_file_range_compat(file, NULL, outfd, NULL,
++						   size, 0);
+ 			if (this_read > 0) {
+ 				if (this_read > size)
+ 					goto error;
 --- a/tools/objtool/Makefile
 +++ b/tools/objtool/Makefile
 @@ -42,6 +42,8 @@ OBJTOOL_LDFLAGS := $(LIBELF_LIBS) $(LIBS

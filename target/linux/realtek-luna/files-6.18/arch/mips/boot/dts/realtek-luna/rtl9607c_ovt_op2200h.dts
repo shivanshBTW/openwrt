@@ -17,26 +17,4 @@
 /dts-v1/;
 
 #include "rtl9607c.dtsi"
-
-/ {
-	model = "OVT OP2200H";
-	compatible = "ovt,op2200h", "realtek,rtl9607c", "rtk,8198d";
-
-	aliases {
-		serial0 = &uart0;
-	};
-
-	chosen {
-		stdout-path = "serial0:115200n8";
-	};
-
-	/* Confirmed by the OP2200H preloader/U-Boot: 256 MiB DDR3. */
-	memory@0 {
-		device_type = "memory";
-		reg = <0x00000000 0x10000000>;
-	};
-};
-
-&nic {
-	status = "disabled";
-};
+#include "rtl9607c_ovt_op2200h-common.dtsi"

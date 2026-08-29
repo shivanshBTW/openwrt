@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * OVT OP2200H dual-PCIe test image.
+ *
+ * This is deliberately separate from the normal milestone-1 DTS. It still
+ * has no NAND node and its image profile still emits initramfs only. Its sole
+ * hardware difference is enabling the recovered dual-controller PCIe path.
+ */
+
+/dts-v1/;
+
+#include "rtl9607c.dtsi"
+#include "rtl9607c_ovt_op2200h-common.dtsi"
+
+/ {
+	model = "OVT OP2200H (dual-PCIe test)";
+	realtek,enable-pcie;
+};

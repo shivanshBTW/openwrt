@@ -2,7 +2,7 @@
 /*
  * Realtek "Luna" RTL960x PCIe host controller driver.
  *
- * ONE driver, TWO chips, selected at runtime from the device-tree root
+ * ONE driver, THREE chips, selected at runtime from the device-tree root
  * compatible. It has to be one file: `pcibios_map_irq()` and
  * `pcibios_plat_dev_init()` are GLOBAL arch hooks with exactly one definition
  * per kernel, so two per-chip host drivers cannot coexist in one image even
@@ -60,6 +60,8 @@
 #include <linux/of_irq.h>
 #include <linux/pci.h>
 #include <linux/types.h>
+
+#include <asm/addrspace.h>
 
 /* SoC system controller registers (KSEG1, uncached). Present on BOTH chips
  * except where the table says otherwise -- see SOC_PINMUX. */
@@ -149,6 +151,27 @@ static const struct luna_pcie_phy luna_pcie_phy_9603cvd[] = {
 };
 
 /*
+ * RTL9607C has two independent PCIe hosts and two different SerDes recipes.
+ * These pairs are recovered directly from PCIE_reset_procedure() in the
+ * OP2200H's own Linux-4.4.140 image. Do not merge the arrays: port 0's RTL8812FE
+ * and port 1's RTL8192F are trained with materially different analog values.
+ */
+static const struct luna_pcie_phy luna_pcie_phy_9607c_p0[] = {
+	{ 0x00, 0x8a50 }, { 0x02, 0x26f9 }, { 0x03, 0x6bcd }, { 0x06, 0x104a },
+	{ 0x09, 0x6307 }, { 0x0b, 0x0009 }, { 0x0c, 0x0800 }, { 0x20, 0x0105 },
+	{ 0x21, 0x1000 },
+	{ 0xff, 0xffff },
+};
+
+static const struct luna_pcie_phy luna_pcie_phy_9607c_p1[] = {
+	{ 0x00, 0x8a50 }, { 0x02, 0x26f9 }, { 0x03, 0x6bcd }, { 0x04, 0x8049 },
+	{ 0x06, 0x1088 }, { 0x07, 0x52b3 }, { 0x08, 0x5285 }, { 0x09, 0x6300 },
+	{ 0x0b, 0x0009 }, { 0x0c, 0x0800 }, { 0x0e, 0x0093 }, { 0x20, 0x0105 },
+	{ 0x21, 0x1000 },
+	{ 0xff, 0xffff },
+};
+
+/*
  * The per-chip table. A field that is 0 is NOT PRESENT on that chip and the
  * caller SKIPS the step -- never writes zero to the register. That idiom is the
  * whole reason this refactor is safe for the RTL9602C: every field the 9602C
@@ -166,8 +189,13 @@ struct luna_pcie_chip {
 	unsigned long hostext;		/* host-controller extension, KSEG1	 */
 	u32 mem_phys, mem_size;
 	u32 io_phys, io_size;
+	u32 mem_cfg_phys;		/* bridge register value; 0 = mem_phys */
+	u32 io_cfg_phys;		/* bridge register value; 0 = io_phys  */
+	u32 dev_cmd;			/* downstream command/status value      */
 
 	u32 pinmux_bit;			/* SOC_PINMUX bit; 0 = no such register	 */
+	u32 misc_clear;			/* SOC_PCI_MISC bits cleared before strobe */
+	u32 misc_set;			/* SOC_PCI_MISC bits held set during strobe */
 	u32 misc_strobe;		/* SOC_PCI_MISC reset bit(s) for THIS port */
 	u32 ip_mac_bit;			/* SOC_IP_SEL MAC gate for THIS port	 */
 	u32 ip_pre_or;			/* extra SOC_IP_SEL bits; 0 = none	 */
@@ -181,6 +209,7 @@ struct luna_pcie_chip {
 	const struct luna_pcie_phy *phy;
 	unsigned int retries;		/* full reset+train attempts		 */
 	unsigned int link_polls;	/* 10 ms polls per attempt		 */
+	unsigned int ltssm_delay_ms;	/* 0 = legacy 50 ms settle		 */
 };
 
 static const struct luna_pcie_chip luna_pcie_9602c = {
@@ -189,7 +218,9 @@ static const struct luna_pcie_chip luna_pcie_9602c = {
 	.hostcfg = 0xb8b00000ul, .devcfg = 0xb8b10000ul, .hostext = 0xb8b01000ul,
 	.mem_phys = 0x19000000u, .mem_size = 0x01000000u,
 	.io_phys = 0x18c00000u, .io_size = 0x00010000u,
+	.dev_cmd = 0x00180007u,
 	.pinmux_bit = PINMUX_PCIE,
+	.misc_clear = PCI_MISC_MDIO_CLR,
 	/* This board trains only with BOTH port reset bits strobed. */
 	.misc_strobe = PCI_MISC_MDIO_P0 | PCI_MISC_MDIO_P1,
 	.ip_mac_bit = IP_SEL_EN_PCIE0,
@@ -214,11 +245,13 @@ static const struct luna_pcie_chip luna_pcie_9603cvd = {
 	.hostcfg = 0xb8b00000ul, .devcfg = 0xb8b10000ul, .hostext = 0xb8b01000ul,
 	.mem_phys = 0x19000000u, .mem_size = 0x01000000u,
 	.io_phys = 0x18c00000u, .io_size = 0x00010000u,
+	.dev_cmd = 0x00180007u,
 	/* ⚠ 0: SOC_PINMUX IS NOT A REGISTER ON THIS DIE. Nothing in this chip's
 	 * stock kernel touches 0xb800004c, and its own chipdef names 0x48/0x4c
 	 * CFG_PCSXF / CFG_PHY_CTRL -- the same pair that, written as the 9602C's
 	 * IO_GPIO_EN, put BASE_PHYAD=25 on this board's PHY bus for weeks. */
 	.pinmux_bit = 0,
+	.misc_clear = PCI_MISC_MDIO_CLR,
 	.misc_strobe = PCI_MISC_MDIO_P1,
 	.ip_mac_bit = IP_SEL_EN_PCIE1,
 	/* ⚠ 0 DELIBERATELY: stock never sets BIT(26) or BIT(0|2|11|12) here, and
@@ -233,9 +266,56 @@ static const struct luna_pcie_chip luna_pcie_9603cvd = {
 	.phy = luna_pcie_phy_9603cvd, .retries = 4, .link_polls = 9,
 };
 
+/*
+ * OP2200H / RTL9607C, stock port 0: RTL8812FE (10ec:f812).
+ *
+ * The stock bridge writes the same legacy IO BAR value on both ports. Linux's
+ * global resource tree cannot register overlapping host IO resources, so the
+ * otherwise-unused 64 KiB window is split into two 32 KiB bookkeeping ranges.
+ * io_cfg_phys preserves the exact stock BAR write. The WiFi drivers use the
+ * separate MMIO BARs below, not this legacy IO BAR.
+ */
+static const struct luna_pcie_chip luna_pcie_9607c_p0 = {
+	.name = "RTL9607C PCIe0", .root_compat = "ovt,op2200h",
+	.intc_compat = "mti,gic", .hwirq = 56,
+	.hostcfg = 0xb8b20000ul, .devcfg = 0xb8b30000ul, .hostext = 0xb8b21000ul,
+	.mem_phys = 0x1a000000u, .mem_size = 0x01000000u,
+	.io_phys = 0x18c00000u, .io_size = 0x00008000u,
+	.mem_cfg_phys = 0x19000000u, .io_cfg_phys = 0x18c00000u,
+	.dev_cmd = 0x00180007u,
+	.misc_clear = BIT(15), .misc_set = BIT(30),
+	.misc_strobe = PCI_MISC_MDIO_P0,
+	.ip_mac_bit = IP_SEL_EN_PCIE0,
+	/* RTL9607C GPIO bank 1 uses the second SWCORE pad-enable word:
+	 * IO_GPIO_EN+4 = phys 0x1b00003c. The sibling RTL9603CVD layout above
+	 * uses 0x1b000040; carrying that address here claims bank 2 instead and
+	 * leaves GPIO40 unable to drive the endpoint's PERST# pin. */
+	.perst_pad_en = 0xbb00003cul, .perst_dir = 0xb8003324ul,
+	.perst_data = 0xb8003328ul, .perst_bit = 8,
+	.phy = luna_pcie_phy_9607c_p0, .retries = 4, .link_polls = 100,
+	.ltssm_delay_ms = 100,
+};
+
+/* OP2200H / RTL9607C, stock port 1: RTL8192F (10ec:818c). */
+static const struct luna_pcie_chip luna_pcie_9607c_p1 = {
+	.name = "RTL9607C PCIe1", .root_compat = "ovt,op2200h",
+	.intc_compat = "mti,gic", .hwirq = 57,
+	.hostcfg = 0xb8b00000ul, .devcfg = 0xb8b10000ul, .hostext = 0xb8b01000ul,
+	.mem_phys = 0x19000000u, .mem_size = 0x01000000u,
+	.io_phys = 0x18c08000u, .io_size = 0x00008000u,
+	.mem_cfg_phys = 0x19000000u, .io_cfg_phys = 0x18c00000u,
+	.dev_cmd = 0x00180007u,
+	.misc_clear = BIT(14), .misc_strobe = PCI_MISC_MDIO_P1,
+	.ip_mac_bit = IP_SEL_EN_PCIE1,
+	.perst_pad_en = 0xbb00003cul, .perst_dir = 0xb8003324ul,
+	.perst_data = 0xb8003328ul, .perst_bit = 7,
+	.phy = luna_pcie_phy_9607c_p1, .retries = 4, .link_polls = 100,
+	.ltssm_delay_ms = 100,
+};
+
 /* ★★★ THE CHIP TABLE MUST SURVIVE INIT -- IT IS NOT INIT DATA (measured
  * 2026-08-27 on the G24W, one panic, one boot lost to stock fallback).
- * `chip` is dereferenced by luna_pcie_access() on EVERY config-space access
+ * `host->chip` is dereferenced by luna_pcie_access() on EVERY config-space access
  * for the life of the system, and config space is touched long after boot:
  * the first wlan0 open runs rtl92fe_hw_init -> pcie_capability_*() at ~21 s,
  * AFTER free_initmem(). With the tables (and the phy arrays their .phy
@@ -249,24 +329,37 @@ static const struct luna_pcie_chip luna_pcie_9603cvd = {
  * The original pcie-rtl9602c.c had no chip table and marked only its
  * init-walked PHY array __initconst; the rewrite introduced the defect.
  * Cost of residency: ~0.5 KB. Do not "optimise" it back. */
-static const struct luna_pcie_chip *chip;	/* resolved in luna_pcie_init() */
-
 static DEFINE_SPINLOCK(luna_pcie_lock);
-static u8 luna_pcie_busnr = 0xff;
 
-static inline void __iomem *pcie_hostcfg(void)
+/* Runtime state belongs to a host controller, never to the SoC globally.
+ * Keeping struct pci_controller first is intentional: MIPS stores its address
+ * in pci_bus::sysdata, so config access and pcibios_map_irq() can recover the
+ * enclosing host directly. This is equivalent to the old single global for
+ * RTL9602C/RTL9603CVD and is the prerequisite for RTL9607C's two live hosts. */
+struct luna_pcie_host {
+	struct pci_controller controller;
+	struct resource mem;
+	struct resource io;
+	const struct luna_pcie_chip *chip;
+	u8 busnr;
+	int virq;
+};
+
+static struct luna_pcie_host luna_pcie_hosts[2];
+
+static inline void __iomem *pcie_hostcfg(const struct luna_pcie_host *host)
 {
-	return (void __iomem *)chip->hostcfg;
+	return (void __iomem *)host->chip->hostcfg;
 }
 
-static inline void __iomem *pcie_devcfg(void)
+static inline void __iomem *pcie_devcfg(const struct luna_pcie_host *host)
 {
-	return (void __iomem *)chip->devcfg;
+	return (void __iomem *)host->chip->devcfg;
 }
 
-static inline void __iomem *pcie_hostext(void)
+static inline void __iomem *pcie_hostext(const struct luna_pcie_host *host)
 {
-	return (void __iomem *)chip->hostext;
+	return (void __iomem *)host->chip->hostext;
 }
 
 /* ---------- config-space accessors ----------
@@ -282,22 +375,25 @@ static inline void __iomem *pcie_hostext(void)
 static int luna_pcie_access(struct pci_bus *bus, unsigned int devfn, int where,
 			    int size, u32 *val, bool is_write)
 {
+	struct luna_pcie_host *host = bus->sysdata;
 	unsigned int slot = PCI_SLOT(devfn);
 	void __iomem *reg;
 	unsigned long flags;
 
-	if (luna_pcie_busnr == 0xff)
-		luna_pcie_busnr = bus->number;
-	if (!chip || bus->number != luna_pcie_busnr || slot > 1)
+	if (!host || !host->chip)
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	if (host->busnr == 0xff)
+		host->busnr = bus->number;
+	if (bus->number != host->busnr || slot > 1)
 		return PCIBIOS_DEVICE_NOT_FOUND;
 	if (size != 1 && size != 2 && size != 4)
 		return PCIBIOS_BAD_REGISTER_NUMBER;
 
 	/* slot 0 = root bridge, slot 1 = the single downstream endpoint. */
-	reg = (slot ? pcie_devcfg() : pcie_hostcfg()) + where;
+	reg = (slot ? pcie_devcfg(host) : pcie_hostcfg(host)) + where;
 
 	spin_lock_irqsave(&luna_pcie_lock, flags);
-	writel(PCI_FUNC(devfn), pcie_hostext() + HOSTEXT_FN);
+	writel(PCI_FUNC(devfn), pcie_hostext(host) + HOSTEXT_FN);
 	mb();			/* order the function-select latch before the access */
 	if (is_write) {
 		if (size == 4)
@@ -342,7 +438,8 @@ static struct pci_ops luna_pcie_ops = {
 
 int pcibios_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 {
-	static int pcie_virq;
+	struct luna_pcie_host *host = dev->bus->sysdata;
+	const struct luna_pcie_chip *chip;
 
 	/* The endpoint's INTx is aggregated by the SoC INTC onto a single input
 	 * line; map that hwirq through the INTC's (linear) irq_domain to obtain
@@ -350,7 +447,10 @@ int pcibios_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 	 * raw hwirq would yield an unmapped virq (no_irq_chip) so request_irq()
 	 * fails with -ENOSYS. The INTC drives handle_level_irq, so the line is
 	 * already level-triggered. */
-	if (!pcie_virq && chip) {
+	if (!host || !host->chip)
+		return 0;
+	chip = host->chip;
+	if (!host->virq) {
 		struct device_node *np;
 
 		np = of_find_compatible_node(NULL, NULL, chip->intc_compat);
@@ -359,33 +459,17 @@ int pcibios_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 
 			of_node_put(np);
 			if (domain)
-				pcie_virq = irq_create_mapping(domain,
-							       chip->hwirq);
+				host->virq = irq_create_mapping(domain,
+							      chip->hwirq);
 		}
 	}
-	return pcie_virq;
+	return host->virq;
 }
 
 int pcibios_plat_dev_init(struct pci_dev *dev)
 {
 	return 0;
 }
-
-/* ---------- bus resources / controller ---------- */
-
-static struct resource luna_pcie_mem = {
-	.name  = "PCIe MEM",
-	.flags = IORESOURCE_MEM,
-};
-static struct resource luna_pcie_io = {
-	.name  = "PCIe IO",
-	.flags = IORESOURCE_IO,
-};
-static struct pci_controller luna_pcie_controller = {
-	.pci_ops      = &luna_pcie_ops,
-	.mem_resource = &luna_pcie_mem,
-	.io_resource  = &luna_pcie_io,
-};
 
 /* ---------- bring-up ---------- */
 
@@ -406,8 +490,9 @@ static struct pci_controller luna_pcie_controller = {
  * boot the link would already be trained and only a RE-train would fail. Named
  * here so it is not re-derived from a symptom.
  */
-static void __init luna_pcie_perst(bool assert)
+static void __init luna_pcie_perst(struct luna_pcie_host *host, bool assert)
 {
+	const struct luna_pcie_chip *chip = host->chip;
 	u32 bit;
 
 	if (!chip->perst_data)
@@ -428,26 +513,57 @@ static void __init luna_pcie_perst(bool assert)
 }
 
 /*
+ * RAM-test diagnostics for boards whose user space has no /dev/mem.  Keep the
+ * reads here, after the MAC gate has been enabled: touching a gated PCIe window
+ * can otherwise stall the CPU bus.  Printing the full shared words lets one
+ * successful controller act as a reference for the failing controller while
+ * the decoded PERST level makes the active-low endpoint reset easy to verify.
+ */
+static void __init luna_pcie_diag(struct luna_pcie_host *host,
+				  const char *result)
+{
+	const struct luna_pcie_chip *chip = host->chip;
+	u32 pad_en = 0, dir = 0, data = 0;
+	unsigned int perst = 1;
+
+	if (chip->perst_data) {
+		pad_en = readl((void __iomem *)chip->perst_pad_en);
+		dir = readl((void __iomem *)chip->perst_dir);
+		data = readl((void __iomem *)chip->perst_data);
+		perst = !!(data & BIT(chip->perst_bit));
+	}
+
+	pr_info("realtek-pcie: %s diag %s: pad_en=%08x dir=%08x data=%08x perst=%u misc=%08x ip_sel=%08x ltssm_ctl=%08x state=%02x mdio=%08x\n",
+		chip->name, result, pad_en, dir, data, perst,
+		readl(SOC_PCI_MISC), readl(SOC_IP_SEL),
+		readl(pcie_hostext(host) + HOSTEXT_LTSSM),
+		readl(pcie_hostcfg(host) + HOSTCFG_LINK) & 0x1f,
+		readl(pcie_hostext(host) + HOSTEXT_MDIO));
+}
+
+/*
  * Full PCIe host bring-up, in the controller's own reset order and timing.
  * Returns 0 once the LTSSM reaches L0 (state 0x11), -ETIMEDOUT otherwise. No
  * access to the 0xb8b0xxxx window happens before the MAC gate is set in step 2,
  * or the CPU bus stalls on an un-acked target.
  */
-static int __init luna_pcie_reset(void)
+static int __init luna_pcie_reset(struct luna_pcie_host *host)
 {
+	const struct luna_pcie_chip *chip = host->chip;
 	u32 v;
 	int i;
 
 	/* 0. Hold the endpoint in reset for the whole bring-up (RTL9603CVD), or
 	 *    just spend the bare timing budget where PERST is tied (RTL9602C). */
-	luna_pcie_perst(true);
+	luna_pcie_perst(host, true);
 	mdelay(10);
 
 	/* 1. PCIe pin mux where the chip has one, then MDIO reset: clear the
 	 *    reset-hold bit and this port's reset bit, then strobe it. */
 	if (chip->pinmux_bit)
 		writel(readl(SOC_PINMUX) | chip->pinmux_bit, SOC_PINMUX);
-	v = readl(SOC_PCI_MISC) & ~(PCI_MISC_MDIO_CLR | chip->misc_strobe);
+	v = readl(SOC_PCI_MISC) & ~(chip->misc_clear | chip->misc_strobe);
+	v |= chip->misc_set;
 	writel(v, SOC_PCI_MISC);
 	mb();
 	writel(v | chip->misc_strobe, SOC_PCI_MISC);
@@ -466,78 +582,100 @@ static int __init luna_pcie_reset(void)
 	mdelay(100);
 
 	/* 3. Arm the LTSSM with the PHY held in reset, then release the PHY reset. */
-	writel(0, pcie_hostext() + HOSTEXT_FN);
-	writel(0x01, pcie_hostext() + HOSTEXT_LTSSM);	/* PHY in reset, LTSSM en */
+	writel(0, pcie_hostext(host) + HOSTEXT_FN);
+	writel(0x01, pcie_hostext(host) + HOSTEXT_LTSSM);	/* PHY in reset, LTSSM en */
 	mb();
-	writel(0x81, pcie_hostext() + HOSTEXT_LTSSM);	/* release PHY reset      */
-	mdelay(50);
+	writel(0x81, pcie_hostext(host) + HOSTEXT_LTSSM);	/* release PHY reset      */
+	mdelay(chip->ltssm_delay_ms ? chip->ltssm_delay_ms : 50);
 
 	/* 4. SerDes PHY tuning over MDIO -- required before POLLING can complete. */
 	for (i = 0; chip->phy[i].reg != 0xff; i++) {
 		writel(((u32)chip->phy[i].val << 16) |
 		       ((u32)chip->phy[i].reg << 8) | 1,
-		       pcie_hostext() + HOSTEXT_MDIO);
+		       pcie_hostext(host) + HOSTEXT_MDIO);
 		mdelay(1);
 	}
 	mdelay(20);
 
 	/* 5. Let the endpoint out of reset, immediately before training. */
-	luna_pcie_perst(false);
+	luna_pcie_perst(host, false);
 
 	/* 6. Poll for link-up (L0). */
 	for (i = 0; i < (int)chip->link_polls; i++) {
-		if ((readl(pcie_hostcfg() + HOSTCFG_LINK) & 0x1f) == LINK_UP_STATE)
+		if ((readl(pcie_hostcfg(host) + HOSTCFG_LINK) & 0x1f) == LINK_UP_STATE) {
+			luna_pcie_diag(host, "link-up");
 			return 0;
+		}
 		mdelay(10);
 	}
+	luna_pcie_diag(host, "timeout");
 	return -ETIMEDOUT;
 }
 
-/* -> the chip this kernel is running on, or NULL. Read from the DEVICE TREE
- * root compatible, never from a Kconfig symbol: one image serves two boards on
- * the rtl9607x subtarget, and the DT is the only thing that tells them apart. */
-static const struct luna_pcie_chip *__init luna_pcie_which(void)
+/*
+ * Select the host(s) from the DEVICE TREE root, never from a Kconfig symbol:
+ * one image serves multiple boards on the rtl9607x subtarget, and only the DT
+ * identifies the actual board. RTL9607C access is additionally gated by an
+ * explicit root boolean. The OP2200H DTS deliberately does not set it yet, so
+ * ordinary milestone-1 images cannot touch untested PCIe registers.
+ */
+static unsigned int __init
+luna_pcie_select(const struct luna_pcie_chip **selected)
 {
-	static const struct luna_pcie_chip *const all[] __initconst = {
-		&luna_pcie_9602c, &luna_pcie_9603cvd,
-	};
-	unsigned int i;
+	struct device_node *root;
+	bool enabled = false;
 
-	for (i = 0; i < ARRAY_SIZE(all); i++)
-		if (of_machine_is_compatible(all[i]->root_compat))
-			return all[i];
-	return NULL;
-}
+	if (of_machine_is_compatible(luna_pcie_9602c.root_compat)) {
+		selected[0] = &luna_pcie_9602c;
+		return 1;
+	}
+	if (of_machine_is_compatible(luna_pcie_9603cvd.root_compat)) {
+		selected[0] = &luna_pcie_9603cvd;
+		return 1;
+	}
+	if (!of_machine_is_compatible(luna_pcie_9607c_p0.root_compat))
+		return 0;
 
-static int __init luna_pcie_init(void)
-{
-	unsigned int attempt;
-	int ret = -ETIMEDOUT;
-
-	chip = luna_pcie_which();
-	if (!chip) {
-		/* NOT an error and NOT a silence: a board whose root compatible
-		 * names neither chip has no host bridge THIS DRIVER knows, and
-		 * saying so is what keeps "no PCIe here" apart from "the PCIe
-		 * bring-up failed". Touching a 0xb8b0xxxx window on a die that
-		 * does not decode it stalls the CPU bus. */
-		pr_info("realtek-pcie: no PCIe host declared for this board -- not registering\n");
+	root = of_find_node_by_path("/");
+	if (root) {
+		enabled = of_property_read_bool(root, "realtek,enable-pcie");
+		of_node_put(root);
+	}
+	if (!enabled) {
+		pr_info("realtek-pcie: OP2200H dual PCIe support present but disabled by DT safety gate\n");
 		return 0;
 	}
 
+	selected[0] = &luna_pcie_9607c_p0;
+	selected[1] = &luna_pcie_9607c_p1;
+	return 2;
+}
+
+static int __init luna_pcie_init_host(struct luna_pcie_host *host,
+				      const struct luna_pcie_chip *chip)
+{
+	u32 io_cfg_phys = chip->io_cfg_phys ? chip->io_cfg_phys : chip->io_phys;
+	u32 mem_cfg_phys = chip->mem_cfg_phys ? chip->mem_cfg_phys : chip->mem_phys;
+	unsigned int attempt;
+	int ret = -ETIMEDOUT;
+
+	host->chip = chip;
+	host->busnr = 0xff;
+	host->virq = 0;
+
 	for (attempt = 0; attempt < chip->retries; attempt++) {
-		ret = luna_pcie_reset();
+		ret = luna_pcie_reset(host);
 		if (!ret)
 			break;
 		pr_info("realtek-pcie: %s link not trained (state=0x%x), retry %u/%u\n",
 			chip->name,
-			readl(pcie_hostcfg() + HOSTCFG_LINK) & 0x1f,
+			readl(pcie_hostcfg(host) + HOSTCFG_LINK) & 0x1f,
 			attempt + 1, chip->retries);
 	}
 	if (ret) {
 		pr_warn("realtek-pcie: %s link did not train after %u attempts (state=0x%x)\n",
 			chip->name, chip->retries,
-			readl(pcie_hostcfg() + HOSTCFG_LINK) & 0x1f);
+			readl(pcie_hostcfg(host) + HOSTCFG_LINK) & 0x1f);
 		return ret;
 	}
 
@@ -548,17 +686,17 @@ static int __init luna_pcie_init(void)
 	 * host bridge (written twice), set 128 B max payload, and enable config
 	 * forwarding. The forwarding-enable is the bit17 write-strobe -- the register
 	 * then reads back the operational value 0x100, but writing 0x100 does not
-	 * enable it. Every value here is IDENTICAL on both chips, established
-	 * separately on each rather than carried across. */
-	writel(chip->io_phys | 1u, pcie_devcfg() + 0x10);
-	writel(chip->mem_phys | 4u, pcie_devcfg() + 0x18);
-	writel(0x00180007, pcie_devcfg() + 0x04);
-	writel(0x00100007, pcie_hostcfg() + HOSTCFG_CMD);
-	writel(0x00100007, pcie_hostcfg() + HOSTCFG_CMD);
-	writeb(readb(pcie_hostcfg() + HOSTCFG_PAYLOAD) & ~0xe0,
-	       pcie_hostcfg() + HOSTCFG_PAYLOAD);
-	writel(readl(pcie_hostcfg() + HOSTCFG_CFGCTL) | CFGCTL_FWD_EN,
-	       pcie_hostcfg() + HOSTCFG_CFGCTL);
+	 * enable it. Values are table-driven because RTL9607C port 0's CPU MMIO
+	 * aperture differs from the bus address written into the endpoint BAR. */
+	writel(io_cfg_phys | 1u, pcie_devcfg(host) + 0x10);
+	writel(mem_cfg_phys | 4u, pcie_devcfg(host) + 0x18);
+	writel(chip->dev_cmd, pcie_devcfg(host) + 0x04);
+	writel(0x00100007, pcie_hostcfg(host) + HOSTCFG_CMD);
+	writel(0x00100007, pcie_hostcfg(host) + HOSTCFG_CMD);
+	writeb(readb(pcie_hostcfg(host) + HOSTCFG_PAYLOAD) & ~0xe0,
+	       pcie_hostcfg(host) + HOSTCFG_PAYLOAD);
+	writel(readl(pcie_hostcfg(host) + HOSTCFG_CFGCTL) | CFGCTL_FWD_EN,
+	       pcie_hostcfg(host) + HOSTCFG_CFGCTL);
 	mb();
 
 	/* Wait for the endpoint's config space to answer before the bus scan so the
@@ -566,24 +704,66 @@ static int __init luna_pcie_init(void)
 	for (attempt = 0; attempt < 20; attempt++) {	/* up to ~1 s */
 		u32 id;
 
-		writel(0, pcie_hostext() + HOSTEXT_FN);
+		writel(0, pcie_hostext(host) + HOSTEXT_FN);
 		mb();
-		id = readl(pcie_devcfg());
+		id = readl(pcie_devcfg(host));
 		if ((id & 0xffff) == PCI_VENDOR_ID_REALTEK)
 			break;
 		mdelay(50);
 	}
 
 	pr_info("realtek-pcie: %s link up at gen%u, bridge 0x%08x, endpoint 0x%08x\n",
-		chip->name, readb(pcie_hostcfg() + HOSTCFG_SPEED) & 0xf,
-		readl(pcie_hostcfg()), readl(pcie_devcfg()));
+		chip->name, readb(pcie_hostcfg(host) + HOSTCFG_SPEED) & 0xf,
+		readl(pcie_hostcfg(host)), readl(pcie_devcfg(host)));
 
-	luna_pcie_mem.start = chip->mem_phys;
-	luna_pcie_mem.end   = chip->mem_phys + chip->mem_size - 1;
-	luna_pcie_io.start  = chip->io_phys;
-	luna_pcie_io.end    = chip->io_phys + chip->io_size - 1;
-	register_pci_controller(&luna_pcie_controller);
+	host->mem.name = chip->name;
+	host->mem.start = chip->mem_phys;
+	host->mem.end = chip->mem_phys + chip->mem_size - 1;
+	host->mem.flags = IORESOURCE_MEM;
+	host->io.name = chip->name;
+	host->io.start = chip->io_phys;
+	host->io.end = chip->io_phys + chip->io_size - 1;
+	host->io.flags = IORESOURCE_IO;
+	host->controller.pci_ops = &luna_pcie_ops;
+	host->controller.mem_resource = &host->mem;
+	host->controller.io_resource = &host->io;
+	/* MIPS resources are CPU addresses; BARs contain bus addresses. */
+	host->controller.mem_offset = chip->mem_phys - mem_cfg_phys;
+	host->controller.io_offset = chip->io_phys - io_cfg_phys;
+	host->controller.io_map_base = CKSEG1ADDR(chip->io_phys);
+	register_pci_controller(&host->controller);
 	return 0;
+}
+
+static int __init luna_pcie_init(void)
+{
+	const struct luna_pcie_chip *selected[ARRAY_SIZE(luna_pcie_hosts)];
+	unsigned int i, count, registered = 0;
+	int first_err = 0;
+
+	count = luna_pcie_select(selected);
+	if (!count) {
+		/* NOT an error and NOT a silence: a board whose root compatible
+		 * names no enabled host has no bridge THIS DRIVER may touch. Accessing
+		 * an undecoded 0xb8b0xxxx window can stall the CPU bus. */
+		pr_info("realtek-pcie: no enabled PCIe host declared for this board -- not registering\n");
+		return 0;
+	}
+
+	for (i = 0; i < count; i++) {
+		int ret;
+
+		ret = luna_pcie_init_host(&luna_pcie_hosts[i], selected[i]);
+		if (ret) {
+			if (!first_err)
+				first_err = ret;
+			continue;
+		}
+		registered++;
+	}
+
+	/* One absent or failed radio must not suppress the other controller. */
+	return registered ? 0 : first_err;
 }
 
 /*

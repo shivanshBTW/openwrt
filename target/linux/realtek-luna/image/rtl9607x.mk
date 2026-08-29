@@ -29,6 +29,20 @@ define Device/ovt_op2200h
 endef
 TARGET_DEVICES += ovt_op2200h
 
+# Same non-persistent safeguards as ovt_op2200h, with the explicit DT gate for
+# the recovered dual PCIe host enabled. This profile is only for UART-observed
+# RAM boot tests; it intentionally declares no KERNEL/IMAGE flash recipe.
+define Device/ovt_op2200h_pcie_test
+  DEVICE_VENDOR := OVT
+  DEVICE_MODEL := OP2200H
+  DEVICE_VARIANT := dual-PCIe test
+  DEVICE_DTS := rtl9607c_ovt_op2200h_pcie_test
+  DEVICE_DTS_DIR := $(DTS_DIR)/realtek-luna
+  SOC := rtl9607c
+  DEVICE_PACKAGES := -mtd -uboot-envtools
+endef
+TARGET_DEVICES += ovt_op2200h_pcie_test
+
 # LANLY G24W (RTL9603CVD). Same interAptiv MIPS32 R2 core as the RTL9607C
 # above -- MEASURED from the board's own /proc/cpuinfo ("MIPS interAptiv
 # V2.0", isa mips32r2, tlb_entries 64) -- so it belongs in THIS subtarget
