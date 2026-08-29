@@ -49,6 +49,8 @@
  */
 
 #include <linux/delay.h>
+#include "gpon_sn.h"	/* the common G.984.3 ONU-SN codec */
+#include "gpon_ploam.h"	/* the core PLOAM FSM + its shell contract */
 #include "gpon_rtl9602c_logic.h"	/* hoisted logic */
 #include <linux/init.h>
 #include <linux/io.h>
@@ -65,7 +67,8 @@
 #include <linux/workqueue.h>
 #include <linux/of.h>
 #include "rtl9602c_gpon_nic.h"
-#include "rtl960x_ponmac.h"		/* clean-room family PON-MAC/SerDes bring-up lib */
+#include "luna_eth_regs.h"	/* SOC_SW_ENABLE + the family register map */
+#include "luna_ponmac.h"		/* clean-room family PON-MAC/SerDes bring-up lib */
 
 /*
  * ANYTHING THIS DRIVER RECEIVES AND CANNOT PLACE leaves through ONE spelling,
@@ -105,7 +108,7 @@
 #define GPON_UNSUP_SUBSYS	"rtl9602c-gpon"
 #include "gpon_unsup.h"		/* shared: the UNSUP report + its rate limit */
 
-#include "rtl960x_gpon_regs.h"	/* the per-SoC offsets; the logic below is chip-agnostic */
+#include "luna_gpon_regs.h"	/* the per-SoC offsets; the logic below is chip-agnostic */
 #define   GPON_BOH_LEN		12		/* stored bytes (TOTAL_OVERHEAD_BITS(96)/8); HW extends via REPEAT */
 #define   GPON_BOH_MAX_LEN	252		/* hardware BOH_LENGTH field cap */
 
@@ -194,6 +197,15 @@ static char *onu_sn = "XPON39013867";	/* TEST-ONLY default = this board's SN, so
 					 * gpon_provision init script at OS startup. */
 static bool gpon_sn_changed;		/* SN (re)provisioned -> FSM must re-range */
 
+/* ⚠ FORWARD DECLARATION.  The core FSM object is defined with the rest of the
+ * shell, far below, but the `onu_sn` module-parameter setter just above needs
+ * to hand it the new serial -- and that setter can fire at insmod, before the
+ * GPON probe has run at all.  gpon_ploam_init() memsets the object and re-seeds
+ * the serial, so an early write is simply overwritten; what must NOT happen is
+ * the core missing an identity change while it is not driving. */
+static struct gpon_ploam luna_ploam;
+static u8 gpon_sn_bytes[8];		/* defined here for the same reason */
+
 static int onu_sn_set(const char *val, const struct kernel_param *kp)
 {
 	int ret = param_set_charp(val, kp);
@@ -225,6 +237,19 @@ static int onu_sn_set(const char *val, const struct kernel_param *kp)
 		if (gpon_sn_differs(onu_sn)) {
 			gpon_parse_sn(onu_sn);
 			gpon_sn_changed = true;
+			/*
+			 * ★ AND THE CORE'S OWN FLAG, UNCONDITIONALLY -- not under
+			 * core_fsm.  The core object must track the identity
+			 * whether or not it is driving, or flipping the switch
+			 * later would hand it a serial it never saw.  That is the
+			 * same rule the init site states for the SN it seeds.
+			 *
+			 * Safe before the GPON probe runs (this is a module
+			 * parameter setter and can fire first): gpon_ploam_init()
+			 * memsets the object and re-seeds the serial from
+			 * gpon_sn_bytes, so an early call is simply overwritten.
+			 */
+			gpon_ploam_set_sn(&luna_ploam, gpon_sn_bytes);
 		}
 	}
 	return ret;
@@ -396,7 +421,7 @@ MODULE_PARM_DESC(data_gem_en, "install the WAN data GEM datapath during config (
 /* trace=0 (default) silences the routine per-PLOAM/per-ACK dumps so the compact
  * O5 timeline survives the lossy serial console; key-PLOAM EVT + O5 lines always print. */
 static bool trace;	/* default 0: per-PLOAM/ACK tracing is SLOW (printk over serial) and perturbs the
-			 * activation timing (breaks ranging when on). Set gpon_rtl960x.trace=1 only for short diagnostics. */
+			 * activation timing (breaks ranging when on). Set gpon_luna.trace=1 only for short diagnostics. */
 module_param(trace, bool, 0644);
 MODULE_PARM_DESC(trace, "verbose per-PLOAM/per-ACK serial spam (default 0)");
 
@@ -415,7 +440,7 @@ MODULE_PARM_DESC(ploam_tx_dbg, "log US-PLOAM CPU-TX ENQ self-clear per send (urg
 /* o5_rearm_burst_gate: re-apply the US burst-gate cluster (0x5188/0x526c/0x6024/0x6260)
  * and re-arm the HW auto-No_message keepalive template on every O5 entry (not just __init),
  * so a re-ranged O5 after a GMAC/SDS reset does not run on US-side reset defaults. Default on;
- * A/B with gpon_rtl960x.o5_rearm_burst_gate=0. */
+ * A/B with gpon_luna.o5_rearm_burst_gate=0. */
 static bool o5_rearm_burst_gate = true;
 module_param(o5_rearm_burst_gate, bool, 0644);
 MODULE_PARM_DESC(o5_rearm_burst_gate, "re-apply US burst-gate cluster + No_message keepalive on each O5 entry (default on)");
@@ -524,7 +549,7 @@ MODULE_PARM_DESC(serdes_tx_xtra, "1=set legacy SerDes-TX D2A/clk-edge bits (stoc
  * TX serializer lock is non-deterministic, which matches the observed cycle-to-cycle US-burst
  * variation (some O5 windows the OLT decodes hundreds of US-OMCI, others it loses the burst at once
  * = LOSi/LOAi "Laser out"). NOTE: serdes_cdr_reset is now writable (0644) so it can be
- * left default-on but A/B'd live. Default on (the fix); gpon_rtl960x.serdes_cdr_reset=0 reverts. */
+ * left default-on but A/B'd live. Default on (the fix); gpon_luna.serdes_cdr_reset=0 reverts. */
 static bool serdes_cdr_reset = true;
 module_param(serdes_cdr_reset, bool, 0644);
 MODULE_PARM_DESC(serdes_cdr_reset, "pulse SDS_ANA_COM_REG12 (0x225b0) bit15 10ms (stock serdesCdr_reset RX_SD_POR_SEL) (stock ponmac step; default on)");
@@ -554,7 +579,7 @@ MODULE_PARM_DESC(usnic_initrdy_repulse, "on PONIC_INITRDY timeout, re-pulse CDR 
  * the same check each FSM poll tick (BOSA-serialized softirq) as a two-tick toggle
  * (off this tick, on next) to avoid a 10ms busy-wait in softirq. RATE-bounded:
  * GPON_CDR_STUCK_MAX fast attempts, then one per GPON_CDR_STUCK_SLOW_TICKS for as
- * long as the wedge persists -- it never stops. Default on; gpon_rtl960x.cdr_stuck_recover=0 disables. */
+ * long as the wedge persists -- it never stops. Default on; gpon_luna.cdr_stuck_recover=0 disables. */
 static bool cdr_stuck_recover = true;
 module_param(cdr_stuck_recover, bool, 0644);
 MODULE_PARM_DESC(cdr_stuck_recover, "recover a wedged DS CDR (GTC_DS_STS==0xca0eca0f) by toggling SP_SDS_EN_RX, like stock (default on)");
@@ -616,24 +641,24 @@ static bool serdes_stock_seq;	/* default 0 = our gpon_serdes_init (stock order t
 module_param(serdes_stock_seq, bool, 0644);
 MODULE_PARM_DESC(serdes_stock_seq, "1=stock rev-A SerDes bring-up order (gpon_serdes_init_stock); 0=our gpon_serdes_init");
 
-/* family_lib: bring the SerDes up via the clean-room rtl960x_ponmac family library
- * (RTL960X_CHIP_9602C path) instead of the inline gpon_serdes_init(). Validates the
+/* family_lib: bring the SerDes up via the clean-room luna_ponmac family library
+ * (LUNA_CHIP_9602C path) instead of the inline gpon_serdes_init(). Validates the
  * family-lib op-table framework on real 9602C silicon: family_lib=1 must reach O5 +
  * lease + keep LAN exactly like family_lib=0 (the lib's 9602C tables are a faithful
- * translation of gpon_serdes_init). Default off; A/B with gpon_rtl960x.family_lib=1. */
-static bool family_lib = true;	/* default ON: the clean-room rtl960x_ponmac family lib is the
+ * translation of gpon_serdes_init). Default off; A/B with gpon_luna.family_lib=1. */
+static bool family_lib = true;	/* default ON: the clean-room luna_ponmac family lib is the
 				 * 9602C SerDes boot bring-up. HW-validated (O5 10/10 over two 5-boot
 				 * runs, LAN ok, WAN leases at the analog rate) = equivalent to the
 				 * inline path (its 9602C op-tables are a faithful, exact-match
-				 * translation of gpon_serdes_init). gpon_rtl960x.family_lib=0 = legacy inline. */
+				 * translation of gpon_serdes_init). gpon_luna.family_lib=0 = legacy inline. */
 module_param(family_lib, bool, 0644);
-MODULE_PARM_DESC(family_lib, "1=bring up SerDes via rtl960x_ponmac family lib (9602C path, default); 0=inline gpon_serdes_init");
+MODULE_PARM_DESC(family_lib, "1=bring up SerDes via luna_ponmac family lib (9602C path, default); 0=inline gpon_serdes_init");
 /* serdes_postmode_perturb: the family-lib path performs TWO US-TX serializer edges
  * AFTER GPON mode is committed that stock rev-A does NOT (DIG_1D[16] reset-B
  * re-sync + a post-mode serdesCdr_reset pulse). These were NEVER cleanly A/B'd
  * (the serdes_cdr_reset param does not gate the family-lib path). DEFAULT 0
  * (=stock-matching: skip them) — prime suspect for cold-start serializer-phase
- * jitter (WAN ~50%). gpon_rtl960x.serdes_postmode_perturb=1 restores legacy behavior. */
+ * jitter (WAN ~50%). gpon_luna.serdes_postmode_perturb=1 restores legacy behavior. */
 static bool serdes_postmode_perturb;	/* default false: skip post-mode perturbations (stock rev-A) */
 module_param(serdes_postmode_perturb, bool, 0644);
 MODULE_PARM_DESC(serdes_postmode_perturb, "1=do post-GPON-mode DIG_1D resync + serdesCdr_reset (legacy); 0=skip (stock rev-A, default)");
@@ -643,7 +668,7 @@ MODULE_PARM_DESC(serdes_postmode_perturb, "1=do post-GPON-mode DIG_1D resync + s
  * RMW, bit7 stayed latched through the whole bring-up = an extra SDS-config reset
  * domain stock never touches -> prime suspect for the per-power-on US-TX serializer/
  * PLL phase re-roll (cold-start WAN ~50%, OLT "Laser out"). DEFAULT 0 = bit0-only
- * (stock = the fix); gpon_rtl960x.serdes_sds_cfgrst=1 restores the legacy bit7+bit0 pulse. */
+ * (stock = the fix); gpon_luna.serdes_sds_cfgrst=1 restores the legacy bit7+bit0 pulse. */
 static bool serdes_sds_cfgrst;	/* default false = stock bit0-only SDS reset */
 module_param(serdes_sds_cfgrst, bool, 0644);
 MODULE_PARM_DESC(serdes_sds_cfgrst, "1=legacy: also pulse CMD_SDS_CFG_RST_PS bit7 in the SDS reset; 0=stock bit0-only (default, the cold-start fix)");
@@ -652,7 +677,7 @@ MODULE_PARM_DESC(serdes_sds_cfgrst, "1=legacy: also pulse CMD_SDS_CFG_RST_PS bit
  * SerDes registers that differed between stock (WAN-up, 100%) and our failing board
  * (cold-start ~50% US-TX "Laser out"). The golden table writes them correctly but the
  * SDS reset wipes REG01 bit14 (shared CMU) / REG11 RX_FILT; this re-applies them AFTER
- * the reset, like stock. DEFAULT 1 = the fix; gpon_rtl960x.serdes_stock_analog=0 = legacy. */
+ * the reset, like stock. DEFAULT 1 = the fix; gpon_luna.serdes_stock_analog=0 = legacy. */
 static bool serdes_stock_analog = true;
 module_param(serdes_stock_analog, bool, 0644);
 MODULE_PARM_DESC(serdes_stock_analog, "1=match live-stock SDS REG01=0x73a4 + REG11 RX_FILT=0 post-reset (default, the cold-start fix); 0=legacy");
@@ -662,7 +687,7 @@ MODULE_PARM_DESC(serdes_stock_analog, "1=match live-stock SDS REG01=0x73a4 + REG
  * (legacy) leaves the CMU/CDR locking against default operating-point values that the
  * partial REG01/REG11 re-apply never fully corrects -> metastable per-power-on lock =
  * the cold-start ~50% "Laser out". Post-reset = stock = deterministic lock every cold
- * boot + soft restart. DEFAULT 1 = the fix; gpon_rtl960x.serdes_analog_postreset=0 = legacy. */
+ * boot + soft restart. DEFAULT 1 = the fix; gpon_luna.serdes_analog_postreset=0 = legacy. */
 static bool serdes_analog_postreset = true;
 module_param(serdes_analog_postreset, bool, 0644);
 MODULE_PARM_DESC(serdes_analog_postreset, "1=program full analog CMU/CDR table AFTER the SDS reset (stock rev-A, default, the cold-start determinism fix); 0=legacy pre-reset");
@@ -768,7 +793,7 @@ MODULE_PARM_DESC(bosa_settle_ms, "ms to settle the BOSA analog before the SerDes
  * (swcore 0x130)=0x00ec0005 (arm on-die over-temp ALARM comparator). Assessment:
  * DRAM-LDO + thermal alarm, NOT the SerDes/laser path — kept as stock platform
  * hygiene (the init we were missing), NOT expected to move the WAN cold-start rate.
- * Default on; A/B revert with gpon_rtl960x.sc_ldo_init=0. */
+ * Default on; A/B revert with gpon_luna.sc_ldo_init=0. */
 static bool sc_ldo_init = true;
 module_param(sc_ldo_init, bool, 0644);
 MODULE_PARM_DESC(sc_ldo_init, "run stock rtk_ldo_init (SC-indirect 0xfdca analog LDO + THERMAL_CTRL_0); default on");
@@ -783,14 +808,14 @@ static void r960_phys_wr(u32 phys, u32 val)
 {
 	iowrite32(val, (void __iomem *)(unsigned long)(0xa0000000u | phys));
 }
-static const struct rtl960x_ops rtl9602c_r960_ops = {
+static const struct luna_ops rtl9602c_r960_ops = {
 	.rd = r960_phys_rd,
 	.wr = r960_phys_wr,
 };
 /* DIAGNOSTIC: skip BOSA TX power-on + APC ignition (keep RX golden / bosa_rx_enable)
  * to isolate whether laser emission is what destabilises the downstream framer
  * lock. Set true ONLY for the laser-vs-DS-RX bisection; normal operation = false. */
-static bool laser_off;		/* default false; set via gpon_rtl960x.laser_off=1 for the isolation test */
+static bool laser_off;		/* default false; set via gpon_luna.laser_off=1 for the isolation test */
 module_param(laser_off, bool, 0444);
 MODULE_PARM_DESC(laser_off, "skip laser TX-enable+APC (DS-RX-vs-laser isolation: laser-on deafens DS RX)");
 /*
@@ -802,7 +827,7 @@ MODULE_PARM_DESC(laser_off, "skip laser TX-enable+APC (DS-RX-vs-laser isolation:
  * BOSA downstream RX (gtc_ds_sts=0x0b LOS+LOF, optic_los=1, ds_rx frozen) — the
  * whole multi-session "OLT never ranges us" wall. With apc_off the ONU reaches
  * O5: DS RX locks (gtc_ds_sts=0x04, ds_rx climbs), the OLT sends Assign_ONU-ID +
- * Ranging_Time, FSM O1..O5. Set gpon_rtl960x.apc_off=0 only to revisit the (harmful)
+ * Ranging_Time, FSM O1..O5. Set gpon_luna.apc_off=0 only to revisit the (harmful)
  * ignition path. See bisection: laser_off (skip both) vs apc_off (skip only APC).
  */
 static bool apc_off = true;	/* default TRUE: apc_off=false (full APC seat) was RE-TESTED (task bdcqpqqn1) and
@@ -842,7 +867,7 @@ MODULE_PARM_DESC(apc_offk, "run rtl8290b_apc_init B-variant OFFK ignition (compl
 static bool gpon_hold;	/* default false: range to O5 normally (so the O5 selftest fires) */
 module_param(gpon_hold, bool, 0444);
 MODULE_PARM_DESC(gpon_hold, "hold the GPON FSM at O1 (no ranging) -> stable br-lan/WiFi for LAN+WiFi access (GPON/WAN disabled)");
-static u8 gpon_sn_bytes[8];		/* G.984.3 ONU-SN: 4-byte ID + 4-byte serial */
+/* gpon_sn_bytes is defined near the top: the onu_sn setter needs it. */
 static struct timer_list gpon_fsm_timer;
 static u8 gpon_fsm_state = 1;		/* O1 */
 static u8 gpon_fsm_onu_id = 0xff;
@@ -925,7 +950,7 @@ static u16 gpon_data_alloc;		/* the OLT's data Alloc-ID, on T-CONT 8 */
  * Alloc-ID) keeps the OLT happy. ⚠ ONLY for OLTs that grant a SEPARATE data Alloc-ID — THIS lab
  * OLT (HSGQ-G008) uses a SINGLE Alloc-ID 0x100 for both OMCC + data (T-CONT 16), so routing data
  * to T-CONT 8 leaves it grantless. DEFAULT off (data rides T-CONT 16, correct for single-alloc);
- * gpon_rtl960x.data_tcont=1 enables the per-data-alloc T-CONT 8 bind for multi-alloc OLTs. */
+ * gpon_luna.data_tcont=1 enables the per-data-alloc T-CONT 8 bind for multi-alloc OLTs. */
 static bool data_tcont;		/* default off: single-alloc OLT (this lab) -> data rides T-CONT 16 */
 module_param(data_tcont, bool, 0644);
 MODULE_PARM_DESC(data_tcont, "bind the OLT data Alloc-ID to its own T-CONT 8 (default OFF -- single-alloc OLT like this lab rides data on T-CONT 16; =1 ONLY for multi-alloc OLTs: on a single-alloc OLT =1 routes data to a grant-less T-CONT 8 and PROVOKES the op=0xFF reclaim -> deact churn)");
@@ -941,62 +966,24 @@ static inline void gpon_wr(u32 off, u32 v) { iowrite32(v, gpon_base + off); }
  */
 #define   SW_MDX_M_EN		BIT(10)
 
-static u16 smi_phy_read(u8 phy, u8 reg)
-{
-	u32 ctrl, data;
-	int i;
+/* ★ THE PROXY BODIES ARE THE FAMILY'S, in luna_gpon_regs.h.  The two SMI
+ * wrappers that used to sit beside these went with them: once sw_proxy_*
+ * delegates to the family (which uses the family's own SMI), nothing here
+ * called them any more and -Werror=unused-function said so.  These four were
+ * written twice -- here and in rtl9607c_gpon.c -- and the copies were identical
+ * (sw_proxy_rd/wr byte for byte, the SMI halves differing only in comments).
+ * The wrappers keep their old names so every call site and this diff stay
+ * small; the only thing they add is this file's own `swcore_base`. */
 
-	iowrite32(phy << 5, swcore_base + SMI_BC_PHYID);
-	iowrite32(BIT(phy), swcore_base + SMI_CTRL_2);
-	iowrite32((0x1FFFu << 11) | ((u32)reg << 6) | SMI_CMD_EN,
-		  swcore_base + SMI_CTRL_0);
-	for (i = 0; i < 1000; i++) {
-		ctrl = ioread32(swcore_base + SMI_CTRL_0);
-		if (!(ctrl & SMI_CMD_EN))
-			break;
-		udelay(10);
-	}
-	data = ioread32(swcore_base + SMI_CTRL_3);
-	return (u16)(data >> 16);
+
+static inline u32 sw_proxy_rd(u32 swc_off)
+{
+	return luna_sw_proxy_rd(swcore_base, swc_off);
 }
 
-static void smi_phy_write(u8 phy, u8 reg, u16 val)
+static inline void sw_proxy_wr(u32 swc_off, u32 val)
 {
-	u32 ctrl;
-	int i;
-
-	iowrite32(phy << 5, swcore_base + SMI_BC_PHYID);
-	iowrite32(BIT(phy), swcore_base + SMI_CTRL_2);
-	iowrite32(val, swcore_base + SMI_CTRL_3);
-	iowrite32((0x1FFFu << 11) | ((u32)reg << 6) | BIT(4) | SMI_CMD_EN,
-		  swcore_base + SMI_CTRL_0);
-	for (i = 0; i < 1000; i++) {
-		ctrl = ioread32(swcore_base + SMI_CTRL_0);
-		if (!(ctrl & SMI_CMD_EN))
-			break;
-		udelay(10);
-	}
-}
-
-static u32 sw_proxy_rd(u32 swc_off)
-{
-	u16 lo, hi;
-
-	smi_phy_write(SWCORE_PROXY_PHY, 0, (u16)(swc_off & 0xffff));
-	smi_phy_write(SWCORE_PROXY_PHY, 1, (u16)((swc_off >> 16) & 0xffff));
-	smi_phy_write(SWCORE_PROXY_PHY, 6, 0x800b);	/* read trigger */
-	lo = smi_phy_read(SWCORE_PROXY_PHY, 4);
-	hi = smi_phy_read(SWCORE_PROXY_PHY, 5);
-	return ((u32)hi << 16) | lo;
-}
-
-static void sw_proxy_wr(u32 swc_off, u32 val)
-{
-	smi_phy_write(SWCORE_PROXY_PHY, 0, (u16)(swc_off & 0xffff));
-	smi_phy_write(SWCORE_PROXY_PHY, 1, (u16)((swc_off >> 16) & 0xffff));
-	smi_phy_write(SWCORE_PROXY_PHY, 2, (u16)(val & 0xffff));
-	smi_phy_write(SWCORE_PROXY_PHY, 3, (u16)((val >> 16) & 0xffff));
-	smi_phy_write(SWCORE_PROXY_PHY, 6, 0x804b);	/* write trigger */
+	luna_sw_proxy_wr(swcore_base, swc_off, val);
 }
 
 /*
@@ -3409,7 +3396,7 @@ MODULE_PARM_DESC(serdes_recommit, "1=also re-commit SerDes inside the O5 mode_se
  * guard cited a live-stock 0x66000 read, but that read was the power-up default
  * BEFORE the rev-A clear, and the "clearing didn't help" test ran while the
  * GEM_US_PORT_MAP stride bug still masked it. Stride is now fixed → re-test with the
- * correct rev-A value. A/B via bootarg gpon_rtl960x.pir_drop=1. */
+ * correct rev-A value. A/B via bootarg gpon_luna.pir_drop=1. */
 static unsigned int pir_drop;
 module_param(pir_drop, uint, 0644);
 MODULE_PARM_DESC(pir_drop, "PON_GEN_PIR_DROP bit18@0x2194: 0=rev-A erratum clear (default, drains T-CONT16), 1=set");
@@ -3424,14 +3411,14 @@ MODULE_PARM_DESC(pir_drop, "PON_GEN_PIR_DROP bit18@0x2194: 0=rev-A erratum clear
  * every prior pir_drop A/B because those toggled ONLY bit18, never METER_OP / WFQ_BURSTSIZE.
  * A zero WFQ_BURSTSIZE plausibly denies the queue any transmit burst -> pipe never arms.
  * The rev-A "must clear PIR_DROP" note is DISPROVEN by this live read (stock rev-A has it
- * SET). Default on = match stock; A/B with gpon_rtl960x.sch_ctrl_stock=0. */
+ * SET). Default on = match stock; A/B with gpon_luna.sch_ctrl_stock=0. */
 static bool sch_ctrl_stock = true;
 module_param(sch_ctrl_stock, bool, 0644);
 MODULE_PARM_DESC(sch_ctrl_stock, "1=write PON_SCH_CTRL 0x2194=0x66000 verbatim from live stock (PIR_DROP+METER_OP+WFQ_BURSTSIZE); 0=legacy bit18-only (default on)");
 /* DPRU_RPT_PRD (0x2568): DBA_BLKSIZE=48 (byte->block divisor the HW uses to encode the
  * DBRu queued-occupancy report the OLT reads to size grants). Stock writes 0x3002 once at
  * init; ours had regressed this write out -> the OLT reads 0 queued despite qid64 holding
- * pages -> grants once then stops -> gemus64=0. Default on; A/B via gpon_rtl960x.dbru_blksize=0. */
+ * pages -> grants once then stops -> gemus64=0. Default on; A/B via gpon_luna.dbru_blksize=0. */
 static bool dbru_blksize = true;
 module_param(dbru_blksize, bool, 0644);
 MODULE_PARM_DESC(dbru_blksize, "1=write DPRU_RPT_PRD 0x2568=0x3002 (DBA_BLKSIZE=48, DBRu report divisor; default on)");
@@ -3446,7 +3433,7 @@ MODULE_PARM_DESC(dbru_blksize, "1=write DPRU_RPT_PRD 0x2568=0x3002 (DBA_BLKSIZE=
  * near-full PBO backpressure watermark that nothing in the scheduler/DBA reads (the DBRu
  * reports the raw used_page count 0x2564), so it stays 0 for a small OMCI backlog even
  * when this works. Judge success by gemus64 climbing + sidpage64 draining + the OLT
- * resuming grants, NEVER by over_sts64. Default on; A/B via gpon_rtl960x.sidvalid_last=0. */
+ * resuming grants, NEVER by over_sts64. Default on; A/B via gpon_luna.sidvalid_last=0. */
 static bool sidvalid_last = true;
 module_param(sidvalid_last, bool, 0644);
 MODULE_PARM_DESC(sidvalid_last, "1=re-issue SIDVALID[64] after the T-CONT-16 arm (stock queue_add tail does this; we had omitted it) (default on)");
@@ -3458,7 +3445,7 @@ MODULE_PARM_DESC(sidvalid_last, "1=re-issue SIDVALID[64] after the T-CONT-16 arm
  * while qid 64 (T-CONT 16) actually holds the pages -> the OLT reads 0 -> grants once ->
  * stops -> gemus64=0, no drain, no bank-underflow, then DEACT (the exact observed wall).
  * Default OFF (match stock: alloc 0x100 -> T-CONT 16 only). A/B via
- * gpon_rtl960x.omcc_alt_bind=1. */
+ * gpon_luna.omcc_alt_bind=1. */
 static bool omcc_alt_bind;
 module_param(omcc_alt_bind, bool, 0644);
 MODULE_PARM_DESC(omcc_alt_bind, "1=also bind the OMCC alloc to T-CONT 1 (non-stock double-bind that makes the DBRu report the empty T-CONT; default off = stock one-T-CONT-per-alloc)");
@@ -3468,7 +3455,7 @@ MODULE_PARM_DESC(omcc_alt_bind, "1=also bind the OMCC alloc to T-CONT 1 (non-sto
  * O5) can clear it -> on an operational grant the HW never opens the US window -> the
  * GEM-US framer never fires (idle16=0, gemus64=0, bank_underfl=0, dead air -> OLT
  * "Laser out"). Re-writing it at O5 entry closes that. Default on; A/B via
- * gpon_rtl960x.o5_sstart=0. */
+ * gpon_luna.o5_sstart=0. */
 static bool o5_sstart = true;
 module_param(o5_sstart, bool, 0644);
 MODULE_PARM_DESC(o5_sstart, "1=re-assert AUTO_PROC_SSTART (0x5200 bit0) at O5 so the HW starts the US burst on each grant (default on)");
@@ -3476,7 +3463,7 @@ MODULE_PARM_DESC(o5_sstart, "1=re-assert AUTO_PROC_SSTART (0x5200 bit0) at O5 so
  * (WSDS_DIG_00 0x22030 bit10) right after the O3 TX-PLL relock — the one edge the
  * O5-light re-arm omits. The relock (a SerDes reset) re-parks the feed; this un-parks
  * it. RISK: pulsing the WSDS GPON reset-B may drop the DS framer lock at O3. Default
- * OFF (try o5_sstart first); A/B via gpon_rtl960x.o3_feed_reset=1. */
+ * OFF (try o5_sstart first); A/B via gpon_luna.o3_feed_reset=1. */
 static bool o3_feed_reset;
 module_param(o3_feed_reset, bool, 0644);
 MODULE_PARM_DESC(o3_feed_reset, "1=pulse WSDS GPON datapath reset-B + light feed re-arm after the O3 TX-PLL relock to un-park the GEM-US framer (default off; risks DS lock)");
@@ -3494,7 +3481,7 @@ MODULE_PARM_DESC(o3_feed_reset, "1=pulse WSDS GPON datapath reset-B + light feed
  * DEACT. The one-shot O5-entry feed re-arm (gpon_us_feed_rearm_light @ O5 entry) is sufficient for the
  * cold-start feed-park it was meant to fix (DHCP still succeeds). Kept as an opt-in diagnostic param;
  * do NOT default it on again without a self-terminate that keys on a RELIABLE progress signal (a per-
- * tick GMII edge is toxic to sustained US either way). A/B via gpon_rtl960x.feed_rekick=1. */
+ * tick GMII edge is toxic to sustained US either way). A/B via gpon_luna.feed_rekick=1. */
 static bool feed_rekick;
 module_param(feed_rekick, bool, 0644);
 MODULE_PARM_DESC(feed_rekick, "1=per-tick US-feed FIFO re-arm at O5 (DEFAULT OFF: the per-tick GMII edge truncates in-flight US bursts + kills sustained WAN data; opt-in diagnostic only)");
@@ -3584,7 +3571,10 @@ static void tbl_write(u32 type, u32 addr)
 
 void rtl9602c_datapath_tables_init(void)
 {
-	void __iomem *ipsel = (void __iomem *)0xb800063cul;	/* SoC PONPBO clk */
+	/* ⚠ THIS POINTER WAS CALLED `ipsel`, WHICH IS ANOTHER REGISTER'S NAME.
+	 * SOC_IP_SEL is 0xb8000600; this is 0xb800063c, and the two gate
+	 * different things. Renamed the day it was proven wrong. */
+	void __iomem *sw_en = SOC_SW_ENABLE;
 	int port, idx;
 
 	/*
@@ -3614,7 +3604,8 @@ void rtl9602c_datapath_tables_init(void)
 		return;
 
 	/* 1) switch_init -------------------------------------------------- */
-	writel(readl(ipsel) | (1u << 5), ipsel);	/* PONPBO IP enable      */
+	writel(readl(sw_en) | SW_EN_BIT, sw_en);	/* see the naming note in
+							 * luna_eth_regs.h    */
 	pi_field(0x2190, 7, 0, 0x6e);			/* PON_TB_CTRL tick      */
 	pi_field(0x2190, 15, 8, 0x95);
 	sw_field(0x25000, 7, 0, 43);			/* METER_TB_CTRL tick    */
@@ -4066,7 +4057,7 @@ void gpon_pbo_init(void)
 							 * despite qid64 holding pages -> grants once then STOPS ->
 							 * gemus64=0. The working firmware programs it once at init
 							 * (its only writer); ours had regressed this write out. A/B via
-							 * gpon_rtl960x.dbru_blksize=0. */
+							 * gpon_luna.dbru_blksize=0. */
 		/* 0x20f4 = PON_IPSTS_US, a READ-ONLY init-ready status reg (bit0=PONIC_INITRDY);
 		 * stock never writes it. The old pi_wr(0x20f4,1) was a no-op write to a reserved
 		 * bit -> removed. It is POLLED before the GMII latch edge below (usnic_initrdy_poll). */
@@ -4591,7 +4582,7 @@ static int gpon_proc_show(struct seq_file *s, void *v)
 	u32 state  = status & GPON_ONU_STATE_MASK;
 
 	if (is_9607c)
-		rtl960x_c7_diag(&rtl9602c_r960_ops, s);
+		luna_c7_diag(&rtl9602c_r960_ops, s);
 	seq_printf(s, "version:     0x%02x\n", gpon_rd(GPON_VERSION) & GPON_VER_ID_MASK);
 	seq_printf(s, "reset:       0x%08x (soft_rst=%d rst_done=%d)\n",
 		   rst, !!(rst & GPON_SOFT_RST), !!(rst & GPON_RST_DONE));
@@ -5331,40 +5322,41 @@ static int gpon_proc_show(struct seq_file *s, void *v)
  * original and offline reference respectively. Keep them in step — a fix here
  * that is not mirrored there makes the offline gate lie about this driver.
  *
- * ★ WHY THE REWIRE DID NOT LAND WITH THE CARVE. Four items, each MEASURED
- * 2026-08-05, not assumed. All four are somebody else's file, which is why the
- * driver was left untouched rather than half-converted:
+ * ★ WHY THE REWIRE DID NOT LAND WITH THE CARVE -- AND WHAT IS LEFT OF THAT.
+ * Four obstacles were MEASURED 2026-08-05.  ALL FOUR ARE NOW GONE (2026-08-28);
+ * the list is kept because each says what a future obstacle of the same kind
+ * looks like, and because "we already checked" is worth nothing without dates.
  *
- *   1. The core has no entry point for the two computations this driver needs
- *      at __init, OUTSIDE any PLOAM dispatch: gpon_set_eqd(0) below and
- *      gpon_apply_boh(false) below. In the core both are `static` (apply_boh,
- *      set_eqd) and reachable only from gpon_ploam_ds(). Calling them from a
- *      shell therefore does not compile, and re-implementing them here would
- *      fork the very code being shared — which is exactly how the now-deleted
- *      gpon_proto.c drifted.
- *   2. gpon_ploam.o is `# gpon-pending` in the shared Makefile, not obj-y, so
- *      the gpon_ploam_* symbols do not exist at link time.
- *   3. ★ NO LONGER TRUE (2026-08-20). This directory's Makefile now carries
- *      `ccflags-y += -I$(srctree)/drivers/net/gpon`, the same line
- *      realtek-elnath has had since the carve, so a shared-tree header DOES
- *      resolve from here -- this file already includes gpon_unsup.h through
- *      it. What that removes is ONLY this obstacle; items 1, 2 and 4 above are
- *      unaffected and each still blocks the PLOAM rewire on its own.
- *   4. gpon_ploam.c's sn_hex_nibble() does NOT reproduce this driver's
- *      hex_to_bin() path, though its comment claims byte-identity: the kernel
- *      returns -1 for a non-hex digit (0xff once stored in the u8), the core
- *      returns 0xf. A valid high nibble with an invalid low one then yields a
- *      DIFFERENT serial-number byte ('7','G' -> 0xff here, 0x7f there;
- *      4660 of 65025 character pairs diverge). Adopting the core's parse would
- *      change the identity this ONU puts on the wire for a malformed
- *      gpon_rtl960x.onu_sn=, so it is a behaviour change, not code motion.
+ *   1. ★ RESOLVED 2026-08-28. The core kept the two computations this driver
+ *      needs at __init -- set_eqd() and apply_boh() -- `static`, reachable only
+ *      from gpon_ploam_ds(), so a shell could not call them. The core now
+ *      exposes gpon_ploam_set_eqd() and gpon_ploam_apply_boh(): the SAME
+ *      functions behind thin wrappers, deliberately not copies, because
+ *      re-implementing the arithmetic here is exactly how gpon_proto.c drifted.
+ *   2. ★ RESOLVED. gpon_ploam.o was `# gpon-pending` in the shared Makefile;
+ *      it is `obj-y` now, so the gpon_ploam_* symbols exist at link time.
+ *   3. ★ RESOLVED 2026-08-20. This directory's Makefile carries
+ *      `ccflags-y += -I$(srctree)/drivers/net/gpon`, so a shared-tree header
+ *      resolves from here.
+ *   4. ★ RESOLVED 2026-08-28, and the diagnosis had the wrong file. The claim
+ *      was that adopting "the core's parse" would change this ONU's identity
+ *      for a malformed onu_sn=. What it actually described was
+ *      gpon_ploam_parse_sn(), a SECOND decoder inside the core that disagreed
+ *      with gpon_sn.c's -- 0xf for a bad nibble where the strict parser
+ *      refuses. It had zero callers and is now a wrapper over the strict one,
+ *      so the core has ONE decoder and this driver is already rebased onto it.
+ *      The behaviour change was made deliberately, with a pr_warn, and it fixes
+ *      a spurious re-range: a malformed string used to manufacture a different
+ *      serial and read as an identity change.
  *
- * Sequencing note: the refactor plan orders this move LAST (step M9) and gives
- * it a prerequisite that is NOT code motion — the FSM below is global-based
- * over ~11 file-scope variables while the core is object-based (struct
- * gpon_ploam), and converting it is a shape change that must land, and be
- * gated, on its own. X111W is off the rig, so none of it is board-verifiable
- * today; a green offline gate gates a boot, it never proves the hardware works.
+ * ⇒ WHAT REMAINS IS NOT AN OBSTACLE, IT IS THE WORK: the FSM below is
+ * global-based over ~11 file-scope variables while the core is object-based
+ * (struct gpon_ploam). That is a shape change, it must land and be gated on its
+ * own, and it is now the ONLY thing between this driver and the common FSM.
+ *
+ * ⚠ AND IT IS NOT BOARD-VERIFIABLE ON DEMAND: a green offline gate GATES a
+ * boot, it never proves the hardware works, so the shape change lands behind
+ * the offline differential first and is confirmed on the board after.
  */
 
 /*
@@ -5378,29 +5370,30 @@ static int gpon_proc_show(struct seq_file *s, void *v)
  * Assign_ONU-ID (0x03) and Ranging_Time (0x04) to reach O5.
  *
  * Per-board serial number stays OUT of the image: default below is overridable
- * via the `gpon_rtl960x.onu_sn=` module/cmdline param (and is wired to gpon_provision's
+ * via the `gpon_luna.onu_sn=` module/cmdline param (and is wired to gpon_provision's
  * factory value for the fleet). Format (G.984.3 ONU-SN): 4 ASCII ID chars + 8 hex digits.
  */
 
-/* Parse "XPON12345678" -> {'X','P','O','N',0x12,0x34,0x56,0x78}. */
-/* Decode "AAAAhhhhhhhh" into the 8-byte G.984.3 ONU-SN.  Split out of
- * gpon_parse_sn() so gpon_sn_differs() compares through the SAME decoder --
- * a second copy would drift and make an identity change look like a no-op. */
+/* Decode "AAAAhhhhhhhh" into the 8-byte G.984.3 ONU-SN.
+ *
+ * REBASED onto the common codec (drivers/net/gpon/gpon_sn.c) 2026-08-28.  This
+ * was a second decoder of one wire format, and it did not agree with the core's:
+ * hex_to_bin() returns -1 on a bad digit, and storing that in a u8 made the byte
+ * 0xff, so "XPON1234567Z" silently decoded to a serial nobody asked for.  It
+ * also accepted a short string by leaving the rest of the bytes as found.
+ *
+ * The core REFUSES malformed input and leaves `out` untouched, which is what
+ * both call sites already wanted: gpon_parse_sn() passes the serial in force,
+ * and gpon_sn_differs() seeds `want` from it -- so a refusal now reads as "not
+ * a different serial" instead of manufacturing one and triggering a re-range.
+ *
+ * The wrapper keeps its name so the call sites and this diff stay small.
+ */
 static void gpon_parse_sn_into(u8 *out, const char *s)
 {
-	int i;
-
-	for (i = 0; i < 4 && s[i]; i++)
-		out[i] = s[i];
-	for (i = 0; i < 4; i++) {
-		u8 hi = 0, lo = 0;
-
-		if (s[4 + 2 * i])
-			hi = hex_to_bin(s[4 + 2 * i]);
-		if (s[4 + 2 * i + 1])
-			lo = hex_to_bin(s[4 + 2 * i + 1]);
-		out[4 + i] = (hi << 4) | lo;
-	}
+	if (gpon_sn_parse(s, out))
+		pr_warn("gpon: ONU-SN \"%s\" is not 4 ID chars + 8 hex digits -- keeping the serial in force\n",
+			s ? s : "(null)");
 }
 
 static void gpon_parse_sn(const char *s)
@@ -6031,6 +6024,13 @@ void gpon_omci_note_gem_create(u16 port_id)
 	}
 	gpon_data_gem_port = port_id;
 	gpon_data_gem_solicited = true;
+	/* ★ AND THE CORE'S OWN COPY, UNCONDITIONALLY.  The core CLEARS
+	 * data_gem_solicited itself on re-admit but nothing SET it, so with
+	 * core_fsm=1 gpon_ploam_poll_provision() would never install the WAN data
+	 * GEM -- the board would range to O5 and carry no user traffic, and the
+	 * A/B would read that as the core FSM being broken.  Set outside the
+	 * switch so the core tracks the OLT's ME 268 whether or not it drives. */
+	gpon_ploam_set_data_gem_solicited(&luna_ploam, true, port_id);
 }
 
 int gpon_install_data_gem(void)
@@ -6098,6 +6098,7 @@ int gpon_install_data_gem(void)
 	gpon_wr(GPON_GTC_DS_TRAFFIC_CFG + GPON_MCAST_FLOW * DS_TRAFFIC_CFG_STRIDE, 0x3);
 
 	gpon_data_installed = true;	/* set BEFORE modeset so its collision-fix keeps flow 1 */
+	gpon_ploam_set_data_installed(&luna_ploam, true);	/* the core's copy */
 
 	/* ===== DATA-FLOW SID CLASSIFY COMMIT (the flow-1 US half-boot fix) =====
 	 * ROOT CAUSE of the ~50/50 data-US latch: the US-NIC RX engine commits its
@@ -6464,8 +6465,11 @@ static void gpon_set_eqd(u32 value)
 {
 	u32 min_delay1 = (gpon_rd(GPON_GTC_US_MIN_DELAY) >> 7) & 0x1ff;
 	u32 eqd1  = value + min_delay1 * 128;
-	u32 multi = eqd1 / GPON_EQD_FRAME_LEN;
-	u32 intra = eqd1 - multi * GPON_EQD_FRAME_LEN;
+	/* The CORE's constant, not a second spelling of it: this arithmetic and
+	 * gpon_ploam.c's set_eqd() must divide by the same number or the A/B
+	 * switch between them would range the ONU differently. */
+	u32 multi = eqd1 / GPON_PLOAM_EQD_FRAME_LEN;
+	u32 intra = eqd1 - multi * GPON_PLOAM_EQD_FRAME_LEN;
 
 	gpon_wr(GPON_GTC_US_EQD,
 		((multi & GPON_EQD_MF_MASK) << GPON_EQD_MF_SHIFT) |
@@ -6511,6 +6515,70 @@ static void gpon_txpll_relock(void)
 	pr_info("rtl9602c-gpon: TX-PLL relock (CMU re-toggle + FIFO re-sync) at O3 entry\n");
 }
 
+/*
+ * ★ LIFTED FOR THE CORE'S ops 2026-08-28.  The ACTION moves; the POLICY stays.
+ * The core's FSM decides WHEN to reseat the CDR and when to arm the key switch;
+ * whether this board should skip a reseat after a healthy O5, and whether a key
+ * is staged at all, are this shell's rules and remain at the call sites.
+ */
+static void gpon_cdr_reseat(void)
+{
+	/* Re-seat US-TX SerDes interface reset-B (softirq-safe, TX-only; the locked
+	 * DS RX framer is undisturbed) so the next re-range starts from a fresh
+	 * serializer lock instead of the prior marginal one. */
+	sw_field(WSDS_DIG_1D, 16, 16, 0);
+	udelay(500);
+	sw_field(WSDS_DIG_1D, 16, 16, 1);
+}
+
+static void gpon_aes_arm_switch(u32 fc)
+{
+	gpon_aes_switch_time = fc;
+	gpon_wr(0x3014, fc);	/* AES_KEY_SWITCH_TIME[29:0] */
+}
+
+/*
+ * ★ LIFTED OUT OF gpon_fsm_set_state() 2026-08-28, BEHAVIOUR UNCHANGED: the
+ * same code, called from the same place.  The core's PLOAM FSM reaches these
+ * two moments through ops -- o5_rearm_burst() and on_below_o5() -- and a body
+ * buried inside a state setter cannot be handed to it.  Extracting them is the
+ * first half of the shape change, and it is deliberately separate from wiring
+ * the FSM so a regression here would be attributable to the extraction alone.
+ */
+static void gpon_o5_rearm_burst(void)
+{
+	u8 nomsg[12];
+
+	/* Re-apply the O5 packed-burst gate cluster + re-arm the HW auto-No_message
+	 * keepalive on EVERY O5 entry, not just at __init.  A re-range performs a
+	 * GMAC/SDS reset that can clear these US-side regs, so a re-ranged O5 must
+	 * not run on reset defaults ("isolated tolerates, packed exposes").
+	 * US-side only, harmless to DS/ranging. */
+	if (!o5_rearm_burst_gate)
+		return;
+	gpon_wr_us_protected(0x5188, 0x00504bfa);	/* US_OPTIC_SD_TH */
+	gpon_field(0x526c, 0, 0, 1);			/* US_PWR_SAV_MODE */
+	gpon_wr(0x6024, (0x10u << 16) | 0x100u);	/* GEM_US_PWR_SAV_CFG */
+	gpon_wr(0x6260, 0x00000028u);			/* GEM_US_EOB_MERGE */
+	memset(nomsg, 0xaa, sizeof(nomsg));
+	nomsg[0] = 0xff;	/* ONU-ID (HW overrides via ONUID_OVRD) */
+	nomsg[1] = 0x04;	/* GPON_PLOAM_US_NOMESSAGE */
+	gpon_send_cpu_ploam(PLM_US_QUEUE_NOMSG, nomsg);
+}
+
+static void gpon_below_o5(void)
+{
+	gpon_rerange_start_j = jiffies ? jiffies : 1;	/* start the outage timer */
+	gpon_o5_entry_tick = 0;
+	if (gpon_vlan_lan_open && !lan_keep_open) {
+		sw_field(0x13008, 0, 0, 1);	/* re-assert VLAN_FILTER for re-config */
+		gpon_vlan_lan_open = false;
+		pr_info("rtl9602c-gpon: re-range -> VLAN_FILTER re-armed (config phase)\n");
+	}
+	/* lan_keep_open (default): leave VLAN_FILTER cleared so LAN management
+	 * survives the WAN-down/re-range; the OLT re-config on resume tolerates it. */
+}
+
 static void gpon_fsm_set_state(u8 st)
 {
 	u8 prev = gpon_fsm_state;
@@ -6553,28 +6621,9 @@ static void gpon_fsm_set_state(u8 st)
 		 * so a re-ranged O5 must not run on reset defaults ("isolated
 		 * tolerates, packed exposes"). Same values as init (4791-4794, 4730-
 		 * 4737); US-side only, harmless to DS/ranging. */
-		if (o5_rearm_burst_gate) {
-			u8 nomsg[12];
-
-			gpon_wr_us_protected(0x5188, 0x00504bfa);	/* US_OPTIC_SD_TH */
-			gpon_field(0x526c, 0, 0, 1);			/* US_PWR_SAV_MODE */
-			gpon_wr(0x6024, (0x10u << 16) | 0x100u);	/* GEM_US_PWR_SAV_CFG */
-			gpon_wr(0x6260, 0x00000028u);			/* GEM_US_EOB_MERGE */
-			memset(nomsg, 0xaa, sizeof(nomsg));
-			nomsg[0] = 0xff;	/* ONU-ID (HW overrides via ONUID_OVRD) */
-			nomsg[1] = 0x04;	/* GPON_PLOAM_US_NOMESSAGE */
-			gpon_send_cpu_ploam(PLM_US_QUEUE_NOMSG, nomsg);
-		}
+		gpon_o5_rearm_burst();
 	} else if (st < 5 && prev >= 5) {
-		gpon_rerange_start_j = jiffies ? jiffies : 1;	/* start the outage timer (O5 dropped) */
-		gpon_o5_entry_tick = 0;
-		if (gpon_vlan_lan_open && !lan_keep_open) {
-			sw_field(0x13008, 0, 0, 1);	/* re-assert VLAN_FILTER for re-config */
-			gpon_vlan_lan_open = false;
-			pr_info("rtl9602c-gpon: re-range -> VLAN_FILTER re-armed (config phase)\n");
-		}
-		/* lan_keep_open (default): leave VLAN_FILTER cleared so LAN management
-		 * survives the WAN-down/re-range; the OLT re-config on resume tolerates it. */
+		gpon_below_o5();
 	}
 	/* The HW ONU_STATE field uses the same 1-based encoding as our state numbers:
 	 * UNKNOWN=0, O1=1, O2=2, O3=3, O4=4, O5=5. So O3 (Serial-Number, where the
@@ -6646,6 +6695,283 @@ static void gpon_cdr_reset_worker(struct work_struct *w)
  *   OMCI responder that had drifted into a weaker copy, and two decoders of one
  *   serial number that disagreed about what a serial number is.
  */
+/*
+ * ===== The core PLOAM shell: this driver, expressed as struct gpon_ploam_ops =====
+ *
+ * ★★ INSTALLED AND SWITCHABLE, BEHIND `core_fsm` (default 0).
+ * gpon_ploam_init() IS called with these ops (see the probe), and
+ * gpon_ploam_ds() dispatches through the core when the parameter is set; with
+ * it clear the FSM below runs byte for byte as before.  This is the A/B, not a
+ * design note.
+ *
+ * ⚠ THIS COMMENT SAID "NOT INSTALLED YET.  Nothing calls gpon_ploam_init() with
+ * these ops" UNTIL 2026-08-28, and by then the init call had been there for a
+ * while.  A stale comment that says the core is unwired is worse than none: it
+ * tells the next reader there is no A/B to run, which is the whole state of
+ * this migration.
+ *
+ * What the ops table bought before it was switched on is still worth stating:
+ * the COMPILER checks that every callback the core demands can actually be
+ * expressed from this driver's existing primitives, with the right types,
+ * before a single line of the FSM moves.  A shim of stubs would prove nothing,
+ * so every op either does the real work or is left NULL with the reason.
+ *
+ * ★ WHY THE SIGNATURES DIFFER WHERE THEY DO.  The core owns the ARITHMETIC and
+ * the shell owns the REGISTER.  gpon_set_eqd() here computes eqd1 from
+ * MIN_DELAY1 and then writes; the core splits that into get_min_delay() +
+ * set_eqd(multiframe, intraframe).  The two arithmetics were compared line by
+ * line on 2026-08-28 and are identical -- value + min_delay1*128, divided by
+ * the upstream frame length -- which is two independent expressions of one
+ * fact agreeing, not one copied from the other.
+ */
+static void luna_op_ploam_tx(void *sh, u8 queue, const u8 m[GPON_PLOAM_US_LEN])
+{
+	(void)sh;			/* single-instance driver: state is file-scope */
+	gpon_send_cpu_ploam(queue, m);
+}
+
+static void luna_op_boh_write(void *sh, u32 cfg_word, const u8 *oh, u8 size)
+{
+	u8 i;
+
+	(void)sh;
+	/* The write half of gpon_apply_boh(): the core composed cfg_word and the
+	 * overhead bytes, so only the registers are left here. */
+	gpon_wr(GPON_GTC_US_BOH_CFG, cfg_word);
+	for (i = 0; i < size; i++)
+		gpon_wr(GPON_GTC_US_BOH_DATA + i * 4, oh[i]);
+}
+
+static u32 luna_op_get_min_delay(void *sh)
+{
+	(void)sh;
+	return (gpon_rd(GPON_GTC_US_MIN_DELAY) >> 7) & 0x1ff;	/* MIN_DELAY1 */
+}
+
+static void luna_op_set_eqd(void *sh, u32 multiframe, u32 intraframe)
+{
+	(void)sh;
+	gpon_wr(GPON_GTC_US_EQD,
+		((multiframe & GPON_EQD_MF_MASK) << GPON_EQD_MF_SHIFT) |
+		(intraframe & GPON_EQD_INFRAME_MASK));
+}
+
+static void luna_op_us_ploam_flush(void *sh)
+{
+	(void)sh;
+	/* PLM_FLUSH_BUF is edge-triggered: 0 THEN 1.  Read-modify-write, because
+	 * CRC_GEN_EN|ONUID_OVRD live in the same word and must survive. */
+	gpon_field(GPON_GTC_US_PLOAM_CFG, 4, 4, 0);
+	gpon_field(GPON_GTC_US_PLOAM_CFG, 4, 4, 1);
+}
+
+static void luna_op_set_hw_state(void *sh, enum gpon_ostate st)
+{
+	(void)sh;
+	gpon_fsm_set_state((u8)st);
+}
+
+static void luna_op_set_hw_onu_id(void *sh, u8 onu_id)
+{
+	(void)sh;
+	/*
+	 * ★★ BOTH REGISTERS, and writing only one was a real divergence in the
+	 * A/B (found 2026-08-28).  The ONU-ID lives in TWO places on this GTC --
+	 * GPON_GTC_DS_ONU_STATUS[15:8] and GPON_GTC_US_ONU_ID[15:8], which the
+	 * register map above calls the "upstream copy" -- and every site in this
+	 * driver's own FSM writes the pair together: the assign at Assign_ONU-ID,
+	 * and every clear back to 0xff.
+	 *
+	 * This op wrote only the downstream one.  Harmless while core_fsm=0
+	 * (nothing calls it), and with the switch flipped the core's watchdog and
+	 * SN-reprovision paths would have cleared the DS status while leaving a
+	 * STALE upstream ONU-ID in the hardware -- so the ONU would keep bursting
+	 * under an identity the OLT had taken back.  The A/B would have read that
+	 * as the core FSM being wrong.
+	 */
+	gpon_field(GPON_GTC_DS_ONU_STATUS, 15, 8, onu_id);
+	gpon_field(GPON_GTC_US_ONU_ID, 15, 8, onu_id);
+}
+
+static void luna_op_on_below_o5(void *sh)
+{
+	(void)sh;
+	gpon_below_o5();
+}
+
+static void luna_op_o5_rearm_burst(void *sh)
+{
+	(void)sh;
+	gpon_o5_rearm_burst();
+}
+
+static void luna_op_install_data_gem(void *sh, u16 gem)
+{
+	int rc;
+
+	(void)sh;
+	/* ★ PLUMB THE VALUE, DO NOT DISCARD IT.  The core passes the OLT's wire
+	 * gem-port-id.  It goes through the function that already OWNS that
+	 * value's semantics -- the 12-bit G.984.3 mask, the refusal to adopt the
+	 * MULTICAST gem as the WAN data gem, and the re-arm when the OLT MOVES the
+	 * port -- rather than assigning gpon_data_gem_port here and re-stating
+	 * three rules that would then drift.
+	 *
+	 * ⚠ THE OP RETURNS void AND THE INSTALL RETURNS int, so the status has
+	 * nowhere to go.  -EAGAIN is NORMAL and frequent (the OMCC GEM must be up
+	 * first, and the FSM retries), so it is not reported; anything else is a
+	 * real failure and says so rather than vanishing.
+	 */
+	gpon_omci_note_gem_create(gem);
+	rc = gpon_install_data_gem();
+	if (rc && rc != -EAGAIN)
+		pr_warn_ratelimited("rtl9602c-gpon: data-GEM %u install failed (%d)\n",
+				    gem, rc);
+}
+
+static void luna_op_cdr_reseat(void *sh)
+{
+	(void)sh;
+	gpon_cdr_reseat();
+}
+
+static void luna_op_aes_arm_switch(void *sh, u32 superframe)
+{
+	(void)sh;
+	gpon_aes_arm_switch(superframe);
+}
+
+static void luna_op_rng(void *sh, u8 *out, unsigned int len)
+{
+	(void)sh;
+	/* No extraction needed: the core wants a randomness SOURCE and this shell
+	 * already uses the kernel's.  gpon_send_key() calls get_random_bytes()
+	 * directly today; both reach the same generator. */
+	get_random_bytes(out, len);
+}
+
+static void luna_op_omci_report_oper_up(void *sh)
+{
+	(void)sh;
+	/* Already an EXPORT_SYMBOL'd cross-module call, and this driver already
+	 * makes it -- the ethernet driver owns the OMCI shell that reports the
+	 * VEIP oper-state AVC.  No design question here; an earlier note in this
+	 * file called it one and was wrong. */
+	rtl9602c_eth_omci_report_oper_up();
+}
+
+static void luna_op_analog_relock(void *sh)
+{
+	(void)sh;
+	gpon_txpll_relock();
+}
+
+static void luna_op_o3_feed_reset(void *sh)
+{
+	(void)sh;
+	gpon_us_feed_rearm();
+}
+
+static void luna_op_aes_stage_key(void *sh, const u8 key[16])
+{
+	(void)sh;
+	gpon_aes_stage_key(key);
+}
+
+static int luna_op_install_omcc(void *sh, u16 gem)
+{
+	(void)sh;
+	return gpon_install_omcc(gem);
+}
+
+static int luna_op_install_tcont(void *sh, u8 tcont, u16 alloc)
+{
+	(void)sh;
+	return gpon_install_tcont(tcont, alloc);
+}
+
+/*
+ * ⚠ THE OPS LEFT NULL, each for a stated reason -- never because they were
+ * forgotten, and never filled with something that merely compiles:
+ *
+ *   trace             OPTIONAL BY CONTRACT, not owed: gpon_ploam.h calls it
+ *                     "NEVER load-bearing, NULL is always legal" and the core
+ *                     null-checks it before every call.
+ */
+/*
+ * ★ THE CORE'S FSM OBJECT, INSTANTIATED BUT NOT YET DRIVING.
+ *
+ * Nothing dispatches through it: gpon_fsm_handle()/gpon_fsm_poll() below still
+ * run this driver's own FSM.  What this step buys is that the COMPILER checks
+ * the coupling -- the ops table, the config the core expects, and the object's
+ * lifetime -- before any behaviour moves.  The shape change (this driver's FSM
+ * is global-based over ~11 file-scope variables; the core is object-based) is
+ * the remaining work, and it lands behind a switch so it can be A/B'd on the
+ * board rather than argued about, the same way msr_top and hw_pppoe were.
+ *
+ * ★ THE CONFIG IS THIS DRIVER'S OWN KNOBS, one for one.  gpon_ploam_cfg's own
+ * comments read "Luna 16" and "Luna 8": the core was carved out of this
+ * driver's lineage, so its configuration surface IS the module parameters that
+ * already exist here.  Nothing is invented to fill it.
+ */
+/* luna_ploam is defined near the top: the onu_sn setter needs it. */
+
+/* File scope, NOT a local: gpon_ploam_init() keeps the pointer. */
+static struct gpon_ploam_cfg luna_ploam_cfg_live __maybe_unused;
+
+static const struct gpon_ploam_cfg luna_ploam_cfg __maybe_unused = {
+	.hold			= false,	/* set from gpon_hold at init */
+	.cdr_reseat_on_reactivate = true,	/* from cdr_reseat_on_reactivate */
+	.o5_rearm_burst_gate	= true,		/* from o5_rearm_burst_gate */
+	.o3_feed_reset		= false,	/* from o3_feed_reset */
+	.data_gem_en		= true,		/* from data_gem_en */
+	.omcc_alt_bind		= false,	/* from omcc_alt_bind */
+	/* ★ DELIBERATELY ZERO, and written down rather than left blank: the core
+	 * reads it as `override ? override : onu_id`, so 0 means "use the LIVE
+	 * ONU-ID" -- which is the rule (the OMCC alloc-CAM is the live ONU-ID,
+	 * never a constant).  This driver has no module parameter for it and
+	 * must not grow one.  Declared here so a config-parity check sees an
+	 * intent instead of an omission. */
+	.omcc_alloc_override	= 0,
+	.omcc_tcont		= GPON_OMCC_TCONT,	/* 16 on Luna */
+	.omcc_tcont_alt		= GPON_OMCC_TCONT_ALT,	/* 1, only when alt_bind */
+	.data_tcont		= GPON_DATA_TCONT,	/* 8 on Luna */
+};
+
+static const struct gpon_ploam_ops luna_ploam_ops __maybe_unused = {
+	.ploam_tx	= luna_op_ploam_tx,
+	.boh_write	= luna_op_boh_write,
+	.get_min_delay	= luna_op_get_min_delay,
+	.set_eqd	= luna_op_set_eqd,
+	.us_ploam_flush	= luna_op_us_ploam_flush,
+	.set_hw_state	= luna_op_set_hw_state,
+	.set_hw_onu_id	= luna_op_set_hw_onu_id,
+	.on_below_o5	= luna_op_on_below_o5,
+	.o5_rearm_burst	= luna_op_o5_rearm_burst,
+	.install_data_gem = luna_op_install_data_gem,
+	.cdr_reseat	= luna_op_cdr_reseat,
+	.aes_arm_switch	= luna_op_aes_arm_switch,
+	.rng		= luna_op_rng,
+	.omci_report_oper_up = luna_op_omci_report_oper_up,
+	.analog_relock	= luna_op_analog_relock,
+	.o3_feed_reset	= luna_op_o3_feed_reset,
+	.aes_stage_key	= luna_op_aes_stage_key,
+	.install_omcc	= luna_op_install_omcc,
+	.install_tcont	= luna_op_install_tcont,
+};
+
+/*
+ * ★ THE A/B SWITCH FOR THE FSM REWIRE.  Default OFF: this driver's own FSM
+ * still runs, byte for byte as before.  Set `core_fsm=1` and the SAME downstream
+ * PLOAM goes to the common core instead, through the ops table above.
+ *
+ * The project's own pattern (msr_top, hw_pppoe): a change this size lands as a
+ * live A/B, not as a claim.  Both FSMs are compiled in and one line chooses.
+ */
+static bool core_fsm;
+module_param(core_fsm, bool, 0644);
+MODULE_PARM_DESC(core_fsm, "dispatch downstream PLOAM through the COMMON core FSM instead of this driver's own (default 0 = this driver's; the A/B for the rewire)");
+
 static void gpon_fsm_handle(const u8 *m)
 {
 	u8 onu_id = m[0], type = m[1];
@@ -6658,6 +6984,21 @@ static void gpon_fsm_handle(const u8 *m)
 	if (trace && type != PLM_DS_UPSTREAM_OVERHEAD && type != PLM_DS_EXT_BURST_LENGTH)
 		pr_info_ratelimited("rtl9602c-gpon: DS PLOAM onu_id=0x%02x type=0x%02x d=%*phN\n",
 				    onu_id, type, 8, d);
+
+	if (core_fsm) {
+		/* ★ TICKS x 10, NOT THE WALL CLOCK, and the more accurate clock is
+		 * the wrong one here.  This FSM does not measure time: it counts
+		 * polls, at a 10 ms mod_timer that is a TARGET and not a guarantee,
+		 * so under load the tick count falls behind wall time -- and every
+		 * timeout in the code being replaced already lives on that slipping
+		 * clock.  Hand the core jiffies_to_msecs() and its timeouts fire on
+		 * a different schedule from the FSM it replaces: the A/B would then
+		 * compare two FSMs AND two clocks, and blame the FSM.
+		 * See ONU-test-case/OWED-ploam-swap-time-unit.md. */
+		gpon_ploam_ds(&luna_ploam, m, GPON_PLOAM_DS_LEN,
+			      gpon_fsm_ticks * 10u);
+		return;
+	}
 
 	switch (type) {
 	case PLM_DS_UPSTREAM_OVERHEAD:
@@ -6837,9 +7178,7 @@ static void gpon_fsm_handle(const u8 *m)
 				/* re-seat US-TX SerDes interface reset-B (softirq-safe, TX-only; the
 				 * locked DS RX framer is undisturbed) so the next re-range starts from a
 				 * fresh serializer lock instead of the prior marginal one (cuts flapping). */
-				sw_field(WSDS_DIG_1D, 16, 16, 0);
-				udelay(500);
-				sw_field(WSDS_DIG_1D, 16, 16, 1);
+				gpon_cdr_reseat();
 				/* AND run the *correct* stock CDR-lock pulse (invert COM_REG12 bit15,
 				 * 10ms, restore) deferred to process context — the 10ms hold cannot run
 				 * here in softirq. The interface reset-B re-strobe above does not re-lock
@@ -6976,8 +7315,7 @@ static void gpon_fsm_handle(const u8 *m)
 			 * staged bank would promote a garbage key and corrupt AES. ACK either way
 			 * so the OLT sees the message handled. */
 			if (gpon_key_staged && fc != gpon_aes_switch_time) {
-				gpon_aes_switch_time = fc;
-				gpon_wr(0x3014, fc);	/* AES_KEY_SWITCH_TIME[29:0] */
+				gpon_aes_arm_switch(fc);
 				pr_info("rtl9602c-gpon: Key_Switching_Time -> arm switch @superframe %u\n",
 					fc);
 			}
@@ -7061,11 +7399,30 @@ static void gpon_fsm_poll(struct timer_list *t)
 	int guard = 0;
 
 	gpon_fsm_ticks++;
+	/*
+	 * ★★ STAGE 2 OF THE A/B: the PERIODIC half, behind the same `core_fsm`
+	 * switch that already selects the downstream dispatch.  With it clear --
+	 * the default -- every block below runs exactly as before and the core's
+	 * polls are never entered, so this stage is inert by construction.
+	 *
+	 * The shape is deliberately `if (core_fsm) <core>;` beside an untouched
+	 * `if (!core_fsm && <original condition>)`, rather than an if/else around
+	 * a restructured body: the original blocks are 428 lines of shell work
+	 * and FSM decisions interleaved, and a diff that moves them is a diff
+	 * nobody can review against the FSM it is meant to reproduce.
+	 *
+	 * ⚠ TICKS x 10, NOT THE WALL CLOCK -- the same reasoning as the DS path.
+	 * See ONU-test-case/OWED-ploam-swap-time-unit.md.
+	 */
+	if (core_fsm)
+		gpon_ploam_tick(&luna_ploam);
 	gpon_led_los_set((gpon_rd(GPON_GTC_DS_LOS_CFG_STS) & GPON_OPTIC_LOS_SIG) != 0);
 	/* SN was (re)provisioned after ranging began (the driver started with the
 	 * placeholder SN, which the OLT auto-ranges as a phantom that never matches
 	 * the provisioned ONU). Drop to O1 and re-offer the new Serial_Number. */
-	if (gpon_sn_changed) {
+	if (core_fsm)
+		gpon_ploam_sn_changed(&luna_ploam, gpon_fsm_ticks * 10u);
+	if (!core_fsm && gpon_sn_changed) {
 		gpon_sn_changed = false;
 		if (gpon_fsm_state > 1) {
 			gpon_fsm_onu_id = 0xff;
@@ -7117,11 +7474,20 @@ static void gpon_fsm_poll(struct timer_list *t)
 	 * idempotently over the OLT's gem, never proactively ahead of it (the 2nd-admit
 	 * churn cause). Driven from the poll (process/timer context) so the US-NIC modeset
 	 * stays off the OMCI-RX softirq; the ME268 arrives in the tolerated config window. */
-	if (gpon_fsm_state == 5 && data_gem_en && gpon_omcc_installed &&
+	/* Both provisioning follow-ups -- the WAN data GEM once the OLT has
+	 * solicited it, and the VEIP oper-up AVC -- are one core poll.  ⚠ The
+	 * AVC's constants live in the core as GPON_PLOAM_AVC_MAX = 3,
+	 * _DELAY_TICKS = 2500 and _PERIOD_TICKS = 150 -- CHECKED against the
+	 * 3 / 2500 / 150 below, and the core carries this driver's own line
+	 * numbers beside them (:6608-:6610), so they are a copy and not a
+	 * coincidence. */
+	if (core_fsm)
+		gpon_ploam_poll_provision(&luna_ploam, gpon_fsm_ticks * 10u);
+	if (!core_fsm && gpon_fsm_state == 5 && data_gem_en && gpon_omcc_installed &&
 	    gpon_data_gem_solicited && !gpon_data_installed)
 		gpon_install_data_gem();
 
-	if (gpon_fsm_state == 5 && gpon_omcc_installed && gpon_avc_sent < 3 &&
+	if (!core_fsm && gpon_fsm_state == 5 && gpon_omcc_installed && gpon_avc_sent < 3 &&
 	    gpon_o5_entry_tick && (gpon_fsm_ticks - gpon_o5_entry_tick) > 2500 &&
 	    ((gpon_fsm_ticks - gpon_o5_entry_tick) % 150) == 0) {
 		rtl9602c_eth_omci_report_oper_up();
@@ -7163,7 +7529,11 @@ static void gpon_fsm_poll(struct timer_list *t)
 	 * phase, mirroring the Deactivate->O1 path (incl. the CDR/reset-B re-seat that
 	 * actually changes the serializer lock). wan_rx>0 on any working or
 	 * slow-leasing link, so this fires only on a genuinely dead/stuck link. */
-	if (o5_provision_watchdog_ticks && gpon_fsm_state == 5 &&
+	if (core_fsm)
+		gpon_ploam_poll_watchdog(&luna_ploam,
+					 rtl9602c_eth_wan_rx_count() == 0,
+					 gpon_fsm_ticks * 10u);
+	if (!core_fsm && o5_provision_watchdog_ticks && gpon_fsm_state == 5 &&
 	    gpon_fsm_onu_id != 0xff && gpon_o5_entry_tick &&
 	    (gpon_fsm_ticks - gpon_o5_entry_tick) > o5_provision_watchdog_ticks &&
 	    rtl9602c_eth_wan_rx_count() == 0) {
@@ -7212,7 +7582,26 @@ static void gpon_fsm_poll(struct timer_list *t)
 		 * SerDes re-seat can blip sds_sdet alone (optic_los stays 0); only a true fiber
 		 * pull drops BOTH. Requiring the AND lets the debounce be short (stock-fast)
 		 * without false-tripping on either transient. */
-		if (optic_los && sds_dark) {
+		/*
+		 * ★★ THE ONE POLL OF THIS SET THAT IS LIVE BY DEFAULT
+		 * (los_rerange_ticks = 30), and it is the fibre-pull path this
+		 * board is validated on: LOS -> re-range -> O5.  So flipping
+		 * core_fsm here is not a formality -- it must be followed by N
+		 * PHYSICAL fibre pulls before anything is concluded.
+		 *
+		 * ⚠ THE TWO WITNESSES ARE READ HERE AND HANDED OVER, never
+		 * re-derived inside the core.  The guard is `optic_los AND NOT
+		 * sds_sdet` deliberately (a pad-steal perturbs optic_los ALONE),
+		 * and a chip with no declared SDS_FIB_STATUS has no second
+		 * witness at all -- which is why sds_dark stays false there
+		 * rather than being manufactured.  A core that re-read these
+		 * would have to know both of those board facts; handed them, it
+		 * does not.
+		 */
+		if (core_fsm)
+			gpon_ploam_poll_los(&luna_ploam, optic_los, sds_dark,
+					    gpon_fsm_ticks * 10u);
+		if (!core_fsm && optic_los && sds_dark) {
 			if (++gpon_los_run == los_rerange_ticks) {
 				pr_info("rtl9602c-gpon: downstream LOS %u ticks (optic_los & !sds_sdet) -> O1 (re-range on light return)\n",
 					gpon_los_run);
@@ -7362,7 +7751,9 @@ static void gpon_fsm_poll(struct timer_list *t)
 	}
 	/* While unregistered in O3, re-offer our Serial_Number_ONU ~twice a second
 	 * (the OLT grants SN windows intermittently). */
-	if (gpon_fsm_state >= 3 && gpon_fsm_onu_id == 0xff &&
+	if (core_fsm)
+		gpon_ploam_poll_sn_reoffer(&luna_ploam, gpon_fsm_ticks * 10u);
+	if (!core_fsm && gpon_fsm_state >= 3 && gpon_fsm_onu_id == 0xff &&
 	    (gpon_fsm_ticks % 50) == 0)
 		gpon_send_sn();
 	/* Periodic O5 upstream-PLOAM keepalive. Once ranged (onu_id != 0xff) the FSM
@@ -7373,7 +7764,9 @@ static void gpon_fsm_poll(struct timer_list *t)
 	 * BCM68620 PLOAM/ack-liveness timeout that fires Deactivate(0x05) ~25-35s after
 	 * provision on ~50%% of boots. Mirrors the un-ranged SN cadence above; US-PLOAM
 	 * only, does not touch DS RX or OMCI. */
-	if (gpon_fsm_state == 5 && gpon_fsm_onu_id != 0xff &&
+	if (core_fsm)
+		gpon_ploam_poll_keepalive(&luna_ploam, gpon_fsm_ticks * 10u);
+	if (!core_fsm && gpon_fsm_state == 5 && gpon_fsm_onu_id != 0xff &&
 	    o5_ploam_keepalive_ticks &&
 	    (gpon_fsm_ticks % o5_ploam_keepalive_ticks) == 0) {
 		u8 nomsg[12];
@@ -7546,7 +7939,7 @@ static int __init rtl9602c_gpon_init(void)
 	 * dal_mgmt_initDevice dispatches 0x96030003 -> dal_rtl9603cvd_mapper_get
 	 * beside 0x96070001 -> dal_rtl9607c_*, with 840 dedicated 9603CVD
 	 * functions -- and its per-chip register table puts the PON SerDes at
-	 * SWCORE +0x040000, exactly where rtl960x_ponmac.c's C3_* constants
+	 * SWCORE +0x040000, exactly where luna_ponmac.c's C3_* constants
 	 * already put it (C3_WSDS_DIG_00 0x1b040030, C3_FIB_EXT_REG21
 	 * 0x1b040e54, C3_SDS_CFG 0x1b000200, C3_SOFTWARE_RST 0x1b0000e0).
 	 * Without this line the G24W fell to the ELSE branch below and ran the
@@ -7558,9 +7951,9 @@ static int __init rtl9602c_gpon_init(void)
 	 * symptom we chased for days -- onu_state O15 with rst_done=0 -- is a
 	 * raw 4-bit field reading 0xF; stock's state vocabulary is O1..O7 and
 	 * contains no O15 at all.
-	 * ⚠ NOT A NEW TABLE: RTL960X_CHIP_9603CVD and its four dispatch cases
-	 *   (rtl960x_ponmac.c:2714/2733/2746/2766) have been in this tree all
-	 *   along, named by NOTHING outside rtl960x_ponmac.{c,h}. The missing
+	 * ⚠ NOT A NEW TABLE: LUNA_CHIP_9603CVD and its four dispatch cases
+	 *   (luna_ponmac.c:2714/2733/2746/2766) have been in this tree all
+	 *   along, named by NOTHING outside luna_ponmac.{c,h}. The missing
 	 *   element was never missing from the source; it was unwired.
 	 */
 	is_9603cvd = of_machine_is_compatible("realtek,rtl9603cvd");
@@ -7760,14 +8153,14 @@ static int __init rtl9602c_gpon_init(void)
 		else if (is_9603cvd)
 			pr_info("rtl9602c-gpon: sc_ldo_init skipped (%s: 0x3c/0x40/0x44 are IO_GPIO_EN here, not SC_IND_*)\n",
 				swc->chip);
-		rtl960x_c2_postmode_perturb = serdes_postmode_perturb;	/* A/B: skip the post-GPON-mode US-TX perturbations (default = skip, stock rev-A) */
-		rtl960x_c2_sds_cfgrst = serdes_sds_cfgrst;	/* A/B: SDS reset = stock bit0-only (default) vs legacy bit7+bit0 */
-		rtl960x_c2_stock_analog = serdes_stock_analog;	/* A/B: match live-stock SDS REG01/REG11 post-reset (default) */
-		rtl960x_c2_analog_postreset = serdes_analog_postreset;	/* A/B: program full analog CMU/CDR table AFTER the SDS reset (stock rev-A, default) = cold-start determinism */
-		rtl960x_c2_cmu_settle_ms = serdes_cmu_settle_ms;	/* A/B: TX-CMU-lock settle before reset-B (cold-start metastability candidate) */
-		rtl960x_c2_clkgate_rstb = serdes_clkgate_rstb;	/* A/B: clock-gated reset-B release (rank-1 cold-start fix candidate) */
-		rtl960x_c2_skip_rstb_dance = serdes_skip_rstb_dance;	/* A/B: skip the gratuitous DIG_1D reset-B pulse (already released) */
-		rtl960x_c2_minimal_analog = serdes_minimal_analog;	/* A/B: skip the over-configure golden-table writes (match stock's minimal set) */
+		luna_c2_postmode_perturb = serdes_postmode_perturb;	/* A/B: skip the post-GPON-mode US-TX perturbations (default = skip, stock rev-A) */
+		luna_c2_sds_cfgrst = serdes_sds_cfgrst;	/* A/B: SDS reset = stock bit0-only (default) vs legacy bit7+bit0 */
+		luna_c2_stock_analog = serdes_stock_analog;	/* A/B: match live-stock SDS REG01/REG11 post-reset (default) */
+		luna_c2_analog_postreset = serdes_analog_postreset;	/* A/B: program full analog CMU/CDR table AFTER the SDS reset (stock rev-A, default) = cold-start determinism */
+		luna_c2_cmu_settle_ms = serdes_cmu_settle_ms;	/* A/B: TX-CMU-lock settle before reset-B (cold-start metastability candidate) */
+		luna_c2_clkgate_rstb = serdes_clkgate_rstb;	/* A/B: clock-gated reset-B release (rank-1 cold-start fix candidate) */
+		luna_c2_skip_rstb_dance = serdes_skip_rstb_dance;	/* A/B: skip the gratuitous DIG_1D reset-B pulse (already released) */
+		luna_c2_minimal_analog = serdes_minimal_analog;	/* A/B: skip the over-configure golden-table writes (match stock's minimal set) */
 		if (force_soc_clk) {
 			/* Match the live-stock (100%-deterministic) SoC sysctl/clock regs that our
 			 * FAIL boot differed from, BEFORE the SerDes CMU locks. Same physical board,
@@ -7807,19 +8200,19 @@ static int __init rtl9602c_gpon_init(void)
 			 * = rev-A. Same ops for both (same SWCORE base; the lib never touches
 			 * the 9607C I2C-indirect decode hole). */
 			if (is_9607c)
-				sret = rtl960x_ponmac_mode_set(RTL960X_CHIP_9607C, RTL960X_REV_C,
-							       RTL960X_SUBTYPE_NONE,
-							       RTL960X_MODE_GPON, &rtl9602c_r960_ops);
+				sret = luna_ponmac_mode_set(LUNA_CHIP_9607C, LUNA_REV_C,
+							       LUNA_SUBTYPE_NONE,
+							       &rtl9602c_r960_ops);
 			else if (is_9603cvd)
 				/* rev/subtype are ignored by this chip's path -- one SerDes
-				 * variant for every rev (rtl960x_ponmac.c:786). */
-				sret = rtl960x_ponmac_mode_set(RTL960X_CHIP_9603CVD, RTL960X_REV_A,
-							       RTL960X_SUBTYPE_NONE,
-							       RTL960X_MODE_GPON, &rtl9602c_r960_ops);
+				 * variant for every rev (luna_ponmac.c:786). */
+				sret = luna_ponmac_mode_set(LUNA_CHIP_9603CVD, LUNA_REV_A,
+							       LUNA_SUBTYPE_NONE,
+							       &rtl9602c_r960_ops);
 			else
-				sret = rtl960x_ponmac_mode_set(RTL960X_CHIP_9602C, RTL960X_REV_A,
-							       RTL960X_SUBTYPE_NONE,
-							       RTL960X_MODE_GPON, &rtl9602c_r960_ops);
+				sret = luna_ponmac_mode_set(LUNA_CHIP_9602C, LUNA_REV_A,
+							       LUNA_SUBTYPE_NONE,
+							       &rtl9602c_r960_ops);
 			via = is_9607c ? "family-lib 9607C"
 			    : is_9603cvd ? "family-lib 9603CVD" : "family-lib 9602C";
 			/* STABILITY fallback: if the lib path ever fails to bring the analog
@@ -7842,7 +8235,7 @@ static int __init rtl9602c_gpon_init(void)
 			 * ARE the 9602C recipe. Their golden table writes ~0x226xx,
 			 * which on the 9603CVD is inside the switch's EXTG_ACTYPE
 			 * match table (0x22000-0x220c4) and unmapped above it -- so
-			 * booting this board with gpon_rtl960x.family_lib=0 would corrupt a
+			 * booting this board with gpon_luna.family_lib=0 would corrupt a
 			 * live LAN path. Refuse instead of doing it. */
 			sret = -ENOTSUPP;
 			via = "REFUSED (family_lib=0 has no 9603CVD SerDes recipe)";
@@ -7867,7 +8260,7 @@ static int __init rtl9602c_gpon_init(void)
 		 * downstream light at the RX pins (physical/lane)". Restores the reg after.
 		 */
 		if (is_9607c) {
-			const struct rtl960x_ops *o = &rtl9602c_r960_ops;
+			const struct luna_ops *o = &rtl9602c_r960_ops;
 			u32 s0 = o->rd(0x1b00028cu);
 			u32 r0 = o->rd(0x1b040c40u);
 			u32 s1, s2;
@@ -8122,12 +8515,13 @@ skip_bosa_init:
 	 * mask/status registers, NOT the burst overhead — removed.)
 	 */
 	gpon_wr_us_protected(GPON_GTC_US_MIN_DELAY, 0x9132);
-	/* ★ REWIRE BLOCKER 1a (see the FSM head comment): this is an __init caller
-	 * of the equalization-delay computation, with no PLOAM in flight. The
-	 * common core keeps that computation `static` inside gpon_ploam.c, reachable
-	 * only from gpon_ploam_ds(), so converting this driver to the core needs the
-	 * core to expose it first. Do not satisfy this by copying the arithmetic
-	 * back in here — that fork is what killed gpon_proto.c. */
+	/* ★ WAS REWIRE BLOCKER 1a, RESOLVED 2026-08-28: this is an __init
+	 * caller of the equalization-delay computation, with no PLOAM in flight.
+	 * The core now exposes gpon_ploam_set_eqd() for exactly this, so the
+	 * conversion no longer needs anything from somebody else's file. Do NOT
+	 * satisfy it by copying the arithmetic back in here -- that fork is what
+	 * killed gpon_proto.c.
+	 */
 	gpon_set_eqd(0);			/* pre-ranging EqD = 290*128 = 0x9100 */
 
 	/*
@@ -8169,9 +8563,11 @@ skip_bosa_init:
 	 * SN burst (gpon_apply_boh in the FSM); this is just a sane state for the
 	 * window between GTC bring-up and those PLOAMs arriving.
 	 */
-	/* ★ REWIRE BLOCKER 1b (see the FSM head comment): the second __init caller
-	 * of a core computation the common layer keeps `static` (apply_boh). Same
-	 * resolution as 1a — export it from gpon_ploam.h, never re-implement it. */
+	/* ★ WAS REWIRE BLOCKER 1b, RESOLVED 2026-08-28: the second __init caller
+	 * of a computation the core used to keep `static`. The core now exposes
+	 * gpon_ploam_apply_boh() for exactly this, so nothing here is waiting on
+	 * somebody else's file. Do NOT re-implement the arithmetic locally --
+	 * that fork is what killed gpon_proto.c. */
 	gpon_apply_boh(false);
 
 	/*
@@ -8194,6 +8590,46 @@ skip_bosa_init:
 	/* Start the PLOAM activation FSM: parse the per-board serial number and
 	 * begin draining downstream PLOAM to drive O1 -> O5. */
 	gpon_parse_sn(onu_sn);
+
+	/* ★ BRING THE CORE'S FSM OBJECT UP ALONGSIDE OURS -- it does not drive yet.
+	 * Placed AFTER the serial number is in force, because gpon_ploam_init()
+	 * takes it: an object seeded with a blank SN would range as a different
+	 * ONU the moment it were switched on, which is exactly the kind of
+	 * difference an A/B must not carry silently. */
+	/* ★ THE CONFIG MUST OUTLIVE THIS FUNCTION.  gpon_ploam_init() STORES the
+	 * pointer (`o->cfg = cfg`); it does not copy the struct.  The first
+	 * version of this block built the config on the STACK and handed over its
+	 * address, so luna_ploam.cfg dangled the moment the block closed.  It
+	 * would not have bitten while core_fsm=0 -- nothing dereferences it --
+	 * and would have read dead stack the first time the switch was flipped,
+	 * which is the worst possible place for it to surface. */
+	luna_ploam_cfg_live = luna_ploam_cfg;
+	luna_ploam_cfg_live.hold = gpon_hold;
+	luna_ploam_cfg_live.cdr_reseat_on_reactivate = cdr_reseat_on_reactivate;
+	luna_ploam_cfg_live.o5_rearm_burst_gate = o5_rearm_burst_gate;
+	luna_ploam_cfg_live.o3_feed_reset = o3_feed_reset;
+	luna_ploam_cfg_live.data_gem_en = data_gem_en;
+	luna_ploam_cfg_live.omcc_alt_bind = omcc_alt_bind;
+	/*
+	 * ★★ THE THREE TICK TUNABLES, AND LEAVING THEM OUT WAS A SILENT
+	 * ASYMMETRY IN THE A/B (found 2026-08-28).  gpon_ploam_cfg carries
+	 * los_rerange_ticks, o5_provision_watchdog_ticks and
+	 * o5_ploam_keepalive_ticks, and nothing here copied them -- so they were
+	 * 0 in the core object while this driver ran with los_rerange_ticks=30.
+	 *
+	 * That does not bite while core_fsm=0 (the core's polls are not driven
+	 * yet), and it would have bitten the moment the switch was flipped: the
+	 * A/B would have compared a driver WITH fibre-pull recovery against a
+	 * core WITHOUT it and blamed the core.  Same class as the stack-allocated
+	 * config above, and the same rule -- an A/B must not carry a difference
+	 * silently.
+	 */
+	luna_ploam_cfg_live.trace = trace;
+	luna_ploam_cfg_live.los_rerange_ticks = los_rerange_ticks;
+	luna_ploam_cfg_live.o5_provision_watchdog_ticks = o5_provision_watchdog_ticks;
+	luna_ploam_cfg_live.o5_ploam_keepalive_ticks = o5_ploam_keepalive_ticks;
+	gpon_ploam_init(&luna_ploam, &luna_ploam_ops, &luna_ploam_cfg_live, NULL,
+			gpon_sn_bytes);
 	pr_info("rtl9602c-gpon: PLOAM FSM start, SN '%s' = %*phN\n",
 		onu_sn, 8, gpon_sn_bytes);
 	INIT_WORK(&gpon_cdr_reset_work, gpon_cdr_reset_worker);

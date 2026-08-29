@@ -40,6 +40,7 @@ config NET_VENDOR_REALTEK
 config RTL9602C_ETH
 	tristate "Realtek RTL9602C (Luna) GMAC + switch"
 	depends on REALTEK_LUNA
+	select GPON_FLOW_OFFLOAD	# the COMMON TC lifecycle, drivers/net/gpon/
 	default y
 	help
 	  Clean-room driver for the RTL9602C GMAC + on-chip switch core.
@@ -53,7 +54,7 @@ config RTL9602C_GPON
 	  Clean-room GPON MAC foundation driver for the RTL9602C. Maps the
 	  GPON MAC register block (SWCORE + 0x700000) and exposes /proc/gpon.
 
-config RTL960X_ETH
+config LUNA_ETH
 	tristate "Realtek Luna (interAptiv) GMAC + switch"
 	depends on REALTEK_LUNA
 	default y
@@ -64,14 +65,6 @@ config RTL960X_ETH
 	  (6 ports, 1 CPU GMAC, no SerDes). The MAC engine is identical on both;
 	  508 of 1361 switch registers move, which is why the table exists and
 	  why neither chip may borrow the other's offsets.
-
-config RTL9607C_GPON
-	tristate "Realtek RTL9607C GPON PON-MAC"
-	depends on REALTEK_LUNA
-	select GPON_CORE	# shared core: drivers/net/gpon/Kconfig
-	default y
-	help
-	  Clean-room GPON driver for the RTL9607C.
 
 if NET_VENDOR_REALTEK
 

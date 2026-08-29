@@ -19,7 +19,7 @@
  *     - realtek-elnath — RTL9607F "Elnath" (Cortina), ARM64 little-endian
  *   and additionally on x86 by the differential suite in dev/rtl9607c-test/,
  *   through the host shims in dev/rtl9607c-test/fuzz_shims/. The prefix is
- *   `gpon_` and deliberately NOT `rtl960x_`: this layer must also serve the
+ *   `gpon_` and deliberately NOT `luna_`: this layer must also serve the
  *   future ARM OLT and other vendors' hardware, so a Realtek-named prefix
  *   would be too narrow.
  *
@@ -34,11 +34,44 @@
  *
  *     TIER    prefix                       holds                    may touch HW
  *     ------  ---------------------------  -----------------------  ------------
- *     core    gpon_                        protocol only: the       NO — never
- *                                          PLOAM FSM, G.988 OMCI
- *                                          + ME model, GEM/T-CONT
- *                                          mapping.  Decides.
- *     family  rtl960x_  and  cortina-      one silicon FAMILY's     yes
+ *     core    gpon_                        LOGIC that is not one     NO — never
+ *                                          family's: the PLOAM FSM,
+ *                                          G.988 OMCI + ME model,
+ *                                          GEM/T-CONT mapping, wire
+ *                                          codecs, and (since
+ *                                          2026-08-28) driver logic
+ *                                          that touches no register
+ *                                          even when it uses Linux.
+ *                                          Decides; never addresses.
+ *
+ *   ★★★ THE CORE WIDENED ON 2026-08-28, BY THE OPERATOR, AND WHY IT HAD TO.
+ *   The tier above used to say "protocol only", and the measurement that forced
+ *   the change is worth keeping: what pins code into a family is NOT the
+ *   hardware.  `cn_flow_replace` is 347 lines with ZERO register accesses and
+ *   could not move, because it allocates, takes netdev references and drives an
+ *   rhashtable -- and the old rule barred those.  Read across both families,
+ *   that is the shape of most of the code: netdev, napi, skb, TC offload,
+ *   timers.  Barring Linux from the core did not keep hardware out; it kept
+ *   SHARED DRIVER LOGIC in two copies, one per family.
+ *
+ *   ⇒ the line is now exactly one thing: **does it name a register or reach a
+ *   bus?**  If not, it is a candidate for the core however much Linux it uses.
+ *
+ *   ⚠⚠ AND THE STRICT SUBSET IS NOT NEGOTIABLE, because it is what this project
+ *   PROVES things with.  These files stay free of Linux APIs as well as of
+ *   MMIO, so they keep building for x86 and keep being fuzzed under
+ *   libFuzzer/ASan/UBSan at thousands of cases per second -- the gate that
+ *   DISCOVERS, against a board boot that only CONFIRMS:
+ *
+ *       gpon_ploam.[hc]   gpon_omci_core.[hc]   gpon_omci_me.[hc]
+ *       gpon_gem_us.[hc]  gpon_sn.[hc]          gpon_regseq.[hc]
+ *
+ *   A file in that list may not gain an allocator, a lock, a device pointer, a
+ *   timer or a sleep.  New core code that needs Linux is a NEW file beside
+ *   them, never an edit to one of them.  `gpon_layer_hostbuild_test.sh` is what
+ *   makes that a fact rather than an intention: it builds the list on the host,
+ *   and it goes red the day one of them stops being buildable there.
+ *     family  luna_  and  cortina-      one silicon FAMILY's     yes
  *                                          hardware: PON-MAC and
  *                                          SerDes bring-up, the
  *                                          switch/NE datapath
@@ -54,13 +87,13 @@
  *             drivers/net/gpon/gpon_omci_core.[hc]  G.988 message layer
  *             drivers/net/gpon/gpon_omci_me.[hc]    G.988 ME model
  *             drivers/net/gpon/gpon_gem_us.[hc]     US GEM and T-CONT mapping
- *     family  realtek-luna  ... realtek/rtl960x_ponmac.c   PON-MAC, SerDes
+ *     family  realtek-luna  ... realtek/luna_ponmac.c   PON-MAC, SerDes
  *     chip    realtek-luna  ... realtek/gpon-rtl9602c.c    RTL9602C GPON shell
  *             realtek-luna  ... realtek/rtl9602c_eth.c     RTL9602C NIC shell
  *             realtek-elnath ... cortina/cortina-gpon.c    RTL9607F GPON shell
  *
  *   ⚠ TWO TIER TRAPS ALREADY PAID FOR, both measured on 2026-08-05:
- *     - rtl960x_ponmac.c LOOKS like the family protocol home because of its
+ *     - luna_ponmac.c LOOKS like the family protocol home because of its
  *       prefix, and is not: it implements ZERO of the ops below (measured —
  *       the file contains no PLOAM, GEM, alloc, ONU-ID, EqD, AES or BOH
  *       identifier at all).  It is family HARDWARE, one tier below the shells.

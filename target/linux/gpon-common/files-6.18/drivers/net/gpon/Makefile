@@ -109,7 +109,7 @@ ccflags-y += -O2
 # BEFORE ADDING AN OBJECT HERE, CHECK IT IS THE RIGHT TIER.  This directory is
 # the CORE tier (prefix gpon_): protocol only, and it must never touch hardware
 # -- no register access, no clock, no lock, no allocator, no device pointer.
-# Family hardware belongs in rtl960x_ or cortina- files, and a single part's
+# Family hardware belongs in luna_ or cortina- files, and a single part's
 # registers in rtl9602c_, rtl9607c_, rtl9607f_ or cortina-gpon.c.  The rule, the
 # file map and the guard are written out ONCE: see "THE THREE TIERS" in
 # gpon_common.h, in this directory.  The guard that enforces purity is
@@ -197,6 +197,13 @@ obj-y += gpon_omci_core.o
 # ITU-T G.988 MANAGED-ENTITY model and MIB store, called by the message layer.
 obj-y += gpon_omci_me.o
 
+# ITU-T G.988 message DECODE for the log: what a downstream PDU IS, in words.
+# ★ A PROMOTION, not a merge: this existed only in the Cortina family and was
+# ABSENT from Luna, so the Luna boards gain a decode they never had.  It only
+# ever formats INTO A BUFFER -- the caller owns the rate limit and the level,
+# because how chatty a board may be on its console is that board's fact.
+obj-y += gpon_omci_trace.o
+
 # ITU-T G.984.3 PLOAM activation state machine (O1..O7) and message builders.
 # ONE kernel consumer today (realtek-luna): the Elnath PON-MAC runs activation
 # in silicon, so there is no second copy this de-duplicates.  It is here for the
@@ -220,3 +227,34 @@ obj-y += gpon_omci_me.o
 # and by NOTHING on hardware, on a board that currently wedges at ~30 s. Build
 # it, freeze the duplicate, migrate when the X111W boots.
 obj-y += gpon_ploam.o
+
+# ─────────────────────────────────────────────────────────────────────────────
+# gpon_regseq.o -- a bring-up expressed as DATA, and the interpreter that runs it.
+#
+# ★ WHY IT IS HERE AND NOT IN A FAMILY.  The register addresses and values of a
+# bring-up are silicon facts and stay with the silicon; "write, set these bits,
+# wait, poll until it clears or give up" is not one, and it had been written per
+# family only because the interpreter and the tables shared a file.
+#
+# ★ IT IS WHAT MADE THE MOVE POSSIBLE: the family version called mdelay() and
+# udelay() directly, which this tier forbids.  With the two delays as ops the
+# same interpreter runs on silicon and against a FIXTURE clock on a host, which
+# is this project's stated preference over one ~200 s board boot.
+obj-y += gpon_regseq.o
+
+# gpon_flow.o -- "which flow is this", decided once for every family.
+# ⚠ NOT in the strict host-buildable subset: it uses Linux's flow-offload API
+# deliberately, which the widened core admits (the line is the REGISTER, not
+# Linux) and the strict subset does not.
+# ⚠ GATED, and the build is what taught it: the Luna targets have no
+# net/flow_offload.h at all, so an unconditional obj-y here is a fatal error on
+# every board without an accelerator.  The operator's call (2026-08-28): a
+# Kconfig symbol per target, so a board with no engine carries ZERO bytes of
+# this -- which matters under the <=64 MB / small-NAND rule.
+obj-$(CONFIG_GPON_FLOW_OFFLOAD) += gpon_flow.o
+
+# gpon_flow_offload.o -- the TC offload LIFECYCLE: the cookie->flow map, the
+# entry and its unwind, destroy, stats, flush.  A family with an accelerator
+# supplies five ops and writes none of this; a family without one compiles
+# neither object.
+obj-$(CONFIG_GPON_FLOW_OFFLOAD) += gpon_flow_offload.o

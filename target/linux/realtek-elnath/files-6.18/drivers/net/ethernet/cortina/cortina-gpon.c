@@ -82,7 +82,7 @@
  * tree keeps exactly one (operator, 2026-08-05: "la idea es poner en común el
  * código que corresponde para no tener mucho duplicado" and, on the two
  * monoliths that each carried their own, "mal, poner en común").  The prefix is
- * gpon_ and not cortina_/rtl960x_ for the same reason: the layer must outlive
+ * gpon_ and not cortina_/luna_ for the same reason: the layer must outlive
  * this vendor.
  *
  * WHAT STAYED HERE, AND WHY IT HAD TO.  Everything that touches the hardware:
@@ -108,6 +108,7 @@
  */
 #include "gpon_omci_core.h"	/* G.988 message layer: omci_onu_input()      */
 #include "gpon_omci_me.h"	/* G.988 ME model: struct omci_onu, the store */
+#include "gpon_omci_trace.h"	/* G.988 decode-to-a-buffer for the log    */
 #include "gpon_gem_us.h"	/* upstream GEM/T-CONT mapping + bind verdict */
 
 #define DRV_NAME		"cortina-gpon"
@@ -1087,11 +1088,6 @@ static char *cg_sn_param;
 module_param_named(sn, cg_sn_param, charp, 0444);
 MODULE_PARM_DESC(sn, "GPON serial number override, \"VVVVHHHHHHHH\" (4 ASCII vendor-id chars + 8 hex VSSN digits). Bring-up/A-B use ONLY: the shipping path is the board's own config volume pushed in by /etc/init.d/gpon-identity, so never bake a serial number into an image's bootargs");
 
-static void cg_sn_format(const u8 sn[8], char out[13])
-{
-	gpon_sn_format(sn, out);
-}
-
 static bool cg_do_bosa_init = true;
 module_param_named(bosa_init, cg_do_bosa_init, bool, 0444);
 MODULE_PARM_DESC(bosa_init, "program the GN25L95 BOSA laser driver over per_i2c before ranging (default on; off = no upstream burst, DS-side diagnostics only)");
@@ -1693,7 +1689,7 @@ static void cg_activate_start(struct cortina_gpon *cg)
 	char sn_str[13];
 	u32 vid;
 
-	cg_sn_format(cg->sn, sn_str);
+	gpon_sn_format(cg->sn, sn_str);
 	dev_info(cg->dev, "activating with serial number %s (source: %s)\n",
 		 sn_str, cg_sn_src_name[cg->sn_src]);
 
@@ -1757,7 +1753,7 @@ static int cg_sn_set(struct cortina_gpon *cg, const char *s, enum cg_sn_src src)
 	changed = cg->sn_src == CG_SN_NONE || memcmp(cg->sn, sn, sizeof(sn));
 	memcpy(cg->sn, sn, sizeof(sn));
 	cg->sn_src = src;
-	cg_sn_format(cg->sn, sn_str);
+	gpon_sn_format(cg->sn, sn_str);
 
 	if (!cg_activate)
 		dev_info(cg->dev, "serial number %s latched (source: %s); activate=0, not ranging\n",
@@ -1795,7 +1791,7 @@ static void cg_sn_wait_work(struct work_struct *work)
 	}
 	memcpy(cg->sn, cg_sn_unprovisioned, sizeof(cg->sn));
 	cg->sn_src = CG_SN_FALLBACK;
-	cg_sn_format(cg->sn, sn_str);
+	gpon_sn_format(cg->sn, sn_str);
 	dev_err(cg->dev,
 		"NO per-board GPON serial number after %ds: is /etc/init.d/gpon-identity running, and is ubi0:ubi_Config mountable? Ranging with the placeholder %s - this is NOT this board's identity, the OLT will not admit it. Push the real one:  echo \"sn <VVVVHHHHHHHH>\" > /proc/gpon\n",
 		CG_SN_WAIT_SECS, sn_str);
@@ -2605,7 +2601,7 @@ static void cg_omcc_try_up(struct cortina_gpon *cg, u8 state)
 		spin_unlock_bh(&cg->omci_lock);
 		cg->veip_avc_retry_ms = 0;
 		schedule_delayed_work(&cg->veip_avc_work, 31 * HZ);
-		cg_sn_format(cg->sn, sn_str);
+		gpon_sn_format(cg->sn, sn_str);
 		dev_info(cg->dev, "OMCI responder armed (%u MIB rows, mds seed 200, sn %s)\n",
 			 cg->omci->nrows, sn_str);
 	}
@@ -2850,23 +2846,18 @@ static void cg_omci_trace_one(struct cortina_gpon *cg, const u8 *pdu,
 			      const char *name)
 {
 	static DEFINE_RATELIMIT_STATE(rs, 5 * HZ, 512);
-	bool is_get = (pdu[2] & 0x1f) == 9;	/* G.988 Table 11.2.2-1: Get */
 	char det[80];
 
+	/* ★ THE DECODE IS THE CORE'S (gpon_omci_describe_get).  What stays here
+	 * is the POLICY -- the rate limit, the log level and the device -- which
+	 * is this board's fact and not G.988's.  The core FORMATS into a buffer
+	 * and cannot print, so it cannot flood a console. */
 	if (!__ratelimit(&rs))
 		return;
-	det[0] = '\0';
-	if (is_get && len >= 10 && n == OMCI_LEN)
-		scnprintf(det, sizeof(det),
-			  " mask=0x%04x rmask=0x%04x unsup=0x%04x failed=0x%04x rc=%u",
-			  ((u16)pdu[8] << 8) | pdu[9],
-			  ((u16)resp[9] << 8) | resp[10],
-			  ((u16)resp[36] << 8) | resp[37],
-			  ((u16)resp[38] << 8) | resp[39], resp[8]);
-	else if (n != OMCI_LEN)
-		scnprintf(det, sizeof(det), " noresp");
+	gpon_omci_describe_get(pdu, len, n == OMCI_LEN ? resp : NULL, n,
+			       det, sizeof(det));
 	dev_info(cg->dev, "OMCI DS: MT=0x%02x %s class=%u inst=%u len=%u%s\n",
-		 pdu[2], is_get ? "GET" : name,
+		 pdu[2], gpon_omci_is_get(pdu, len) ? "GET" : name,
 		 ((u16)pdu[4] << 8) | pdu[5], ((u16)pdu[6] << 8) | pdu[7],
 		 len, det);
 }
@@ -2887,16 +2878,6 @@ static void cg_omci_trace_one(struct cortina_gpon *cg, const u8 *pdu,
 static void cg_rx_omci(const u8 *pdu, unsigned int len)
 {
 	struct cortina_gpon *cg = READ_ONCE(cg_singleton);
-	static const char *const mt_name[32] = {
-		[4] = "Create", [5] = "Delete", [8] = "Set", [9] = "Get",
-		[11] = "Get-all-alarms", [12] = "Get-all-alarms-next",
-		[13] = "MIB-upload", [14] = "MIB-upload-next",
-		[15] = "MIB-reset", [16] = "Alarm", [17] = "AVC", [18] = "Test",
-		[19] = "Start-SW-dl", [20] = "DL-section", [21] = "End-SW-dl",
-		[22] = "Activate-SW", [23] = "Commit-SW", [24] = "Sync-time",
-		[25] = "Reboot", [26] = "Get-next", [27] = "Test-result",
-		[28] = "Get-current-data", [29] = "Set-table",
-	};
 	const char *name;
 	u8 mt;
 
@@ -2909,7 +2890,7 @@ static void cg_rx_omci(const u8 *pdu, unsigned int len)
 	cg->omci_rx++;
 
 	mt = pdu[2];
-	name = mt_name[mt & 0x1f] ? mt_name[mt & 0x1f] : "?";
+	name = gpon_omci_mt_name(mt);	/* G.988 Table 11.2.2-1, in the core */
 	/* log the first PDUs + then 1-in-64 (the MIB-upload walk is chatty) */
 	if (cg->omci_rx <= 24 || !(cg->omci_rx & 63))
 		dev_info(cg->dev,
@@ -3561,7 +3542,7 @@ static int cg_proc_show(struct seq_file *m, void *v)
 	/* The identity, and WHERE it came from: "board" is the only value that
 	 * means "read from this unit"; NONE = ranging is still held off waiting
 	 * for it, FALLBACK = a placeholder, not this board's serial number. */
-	cg_sn_format(cg->sn, sn_str);
+	gpon_sn_format(cg->sn, sn_str);
 	seq_printf(m, "serial-number  = %s\n",
 		   cg->sn_src == CG_SN_NONE ? "(not provisioned)" : sn_str);
 	seq_printf(m, "sn-source      = %s%s\n", cg_sn_src_name[cg->sn_src],

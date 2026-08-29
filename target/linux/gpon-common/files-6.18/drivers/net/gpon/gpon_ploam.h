@@ -525,8 +525,6 @@ void gpon_ploam_init(struct gpon_ploam *o, const struct gpon_ploam_ops *ops,
 /* Parse a provisioned serial number in the G.984.3 CLI form "XPON12345678"
  * (4 ASCII vendor-ID chars + 8 hex digits) into 8 wire bytes.
  * Moved from gpon-rtl9602c.c:5000-5015. Pure; no context needed. */
-void gpon_ploam_parse_sn(const char *s, u8 sn[8]);
-
 /* Install a (re)provisioned serial number and ask the FSM to re-range. The
  * re-range itself happens on the next gpon_ploam_sn_changed() call, exactly as
  * the driver's gpon_sn_changed flag did. */
@@ -581,6 +579,7 @@ int gpon_ploam_poll_keepalive(struct gpon_ploam *o, u32 now_ms);
 /* G.984.3 O-state name, for logs and /proc. Canonical spelling (O1 is
  * *Initial*, O2 is Standby) — the oracle's enum has these shifted, which is
  * recorded as a defect of the oracle, not of either driver. */
-const char *gpon_ploam_state_name(enum gpon_ostate st);
-
+/* The two computations a SHELL needs at __init, outside any PLOAM dispatch --
+ * see the note beside their definitions.  Both are the core's own arithmetic;
+ * a shell that re-implements either forks the code it is supposed to share. */
 #endif /* GPON_PLOAM_H */

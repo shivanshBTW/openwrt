@@ -117,6 +117,7 @@
  *      GEM Port-ID has always come from Configure_Port-ID.
  */
 
+#include "gpon_sn.h"	/* the one ONU-SN codec */
 #include "gpon_ploam.h"
 
 /* Cadences and thresholds that were bare literals in the driver. Values
@@ -384,6 +385,8 @@ static void set_eqd(struct gpon_ploam *o, u32 value)
 
 	o->ops->set_eqd(o->sh, multi, intra);
 }
+
+
 
 /* ---------------------------------------------------------------------------
  * State transitions, from gpon-rtl9602c.c:6068-6140.
@@ -1090,35 +1093,6 @@ int gpon_ploam_poll_keepalive(struct gpon_ploam *o, u32 now_ms)
  * its hex_to_bin() result: the kernel returns -1 there, so a bad character
  * yields 0xf in that nibble rather than being rejected. Elnath validates its
  * serial number instead; converging is FOLLOW-UP P7 and a behaviour change. */
-static u8 sn_hex_nibble(char c)
-{
-	if (c >= '0' && c <= '9')
-		return (u8)(c - '0');
-	if (c >= 'a' && c <= 'f')
-		return (u8)(c - 'a' + 10);
-	if (c >= 'A' && c <= 'F')
-		return (u8)(c - 'A' + 10);
-	return 0xf;			/* kernel hex_to_bin() returns -1 here */
-}
-
-void gpon_ploam_parse_sn(const char *s, u8 sn[8])
-{
-	int i;
-
-	if (!s || !sn)
-		return;
-	for (i = 0; i < 4 && s[i]; i++)
-		sn[i] = (u8)s[i];
-	for (i = 0; i < 4; i++) {
-		u8 hi = 0, lo = 0;
-
-		if (s[4 + 2 * i])
-			hi = sn_hex_nibble(s[4 + 2 * i]);
-		if (s[4 + 2 * i + 1])
-			lo = sn_hex_nibble(s[4 + 2 * i + 1]);
-		sn[4 + i] = (u8)((hi << 4) | lo);
-	}
-}
 
 void gpon_ploam_set_sn(struct gpon_ploam *o, const u8 sn[8])
 {
@@ -1165,16 +1139,3 @@ void gpon_ploam_init(struct gpon_ploam *o, const struct gpon_ploam_ops *ops,
 	o->aes_switch_time = 0xffffffff;
 }
 
-const char *gpon_ploam_state_name(enum gpon_ostate st)
-{
-	switch (st) {
-	case GPON_O1_INITIAL:	return "O1-Initial";
-	case GPON_O2_STANDBY:	return "O2-Standby";
-	case GPON_O3_SERIAL:	return "O3-Serial-Number";
-	case GPON_O4_RANGING:	return "O4-Ranging";
-	case GPON_O5_OPERATION:	return "O5-Operation";
-	case GPON_O6_POPUP:	return "O6-POPUP";
-	case GPON_O7_EMERGENCY:	return "O7-Emergency-Stop";
-	}
-	return "O?-unknown";
-}

@@ -8,7 +8,7 @@
  *
  *	CPU <-> GMAC0 (eth0) <-> switch CPU-port <-> physical LAN port <-> wire
  *
- * ★★ WHY THIS FILE IS NAMED rtl960x_* AND NOT rtl9607c_*.
+ * ★★ WHY THIS FILE IS NAMED luna_* AND NOT rtl9607c_*.
  * It serves TWO chips, and the project's naming rule is explicit: family-shared
  * code may not hide behind one chip's name, because the next human or LLM has to
  * land on the work BY NAME. It was renamed the day the second chip was proven to
@@ -64,6 +64,7 @@
 #include <linux/of_net.h>
 #include <linux/platform_device.h>
 #include <linux/timer.h>
+#include "luna_eth_regs.h"	/* the family MAC/switch register map + per-chip table */
 
 /* ---- bring-up knobs (live-tunable; the datapath framing is HW-uncertain on
  * first contact, so expose the few values most likely to need a tweak) ------ */
@@ -190,7 +191,7 @@ MODULE_PARM_DESC(rst_rxfifo,
  * precedence -- "U-Boot ethaddr bootarg -> DT/nvmem -> random LAA" -- is to
  * hand the address in on the kernel command line:
  *
- *     rtl960x_eth.mac=5c:19:23:b3:ce:90
+ *     luna_eth.mac=5c:19:23:b3:ce:90
  *
  * ⚠ AND THE VALUE IS NOT WRITTEN HERE OR IN THE DTS. It is per-UNIT, and a DTS
  * literal would hand the second G24W the first one's identity -- silently, on a
@@ -237,23 +238,12 @@ module_param(cpu_no_loopback, bool, 0644);
 MODULE_PARM_DESC(cpu_no_loopback, "drop the CPU port from its own egress flood (stops self-loopback RX)");
 
 /* ---- GMAC0 register block (offsets from the DT reg base 0x18012000) -------- */
-#define R_IDR0		0x00	/* station MAC [0:3], MSB first			*/
-#define R_IDR4		0x04	/* station MAC [4:5] in [31:16]			*/
 #define R_MAR0		0x08	/* multicast hash [31:0]				*/
 #define R_MAR4		0x0C	/* multicast hash [63:32]			*/
 #define R_CMD		0x3B	/* 8-bit command: bit0 RST			*/
 #define   CMD_RXCHK	0x02	/* RX checksum offload				*/
 #define   CMD_RXJUMBO	0x08	/* accept jumbo					*/
-#define R_IMR		0x3C	/* 16-bit RX/TX interrupt mask			*/
-#define R_ISR		0x3E	/* 16-bit RX/TX interrupt status (W1C)		*/
-#define R_TCR		0x40	/* TX control					*/
-#define R_RCR		0x44	/* RX control (bit0 = accept-all-physical)	*/
-#define R_CPUTAGCR	0x48	/* CPU-tag insert config			*/
-#define R_CONFIG	0x4C
-#define R_CPUTAG1CR	0x50
 #define R_MSR		0x58	/* media/flow status; top byte = force flow ctl	*/
-#define R_IMR0		0xD0	/* 32-bit per-ring TX-completion mask		*/
-#define R_ISR1		0xD8	/* 32-bit per-ring TX-completion status (W1C)	*/
 #define R_TxFDP0	0x1300	/* TX ring0 fetch-descriptor pointer		*/
 #define R_TxCDO0	0x1304	/* TX ring0 current-descriptor offset (u16)	*/
 #define R_RRING_ROUTE	0x1370	/* RX class -> ring routing			*/
@@ -262,15 +252,45 @@ MODULE_PARM_DESC(cpu_no_loopback, "drop the CPU port from its own egress flood (
 				/* 32-BIT register. The (u16) this comment used to carry
 				 * named the FIELD, and an iowrite16 was written to match
 				 * it -- see the store below.			*/
-#define R_RxDesNum	0x1430	/* RX ring0 size + flow-control thresholds	*/
-#define R_IO_CMD	0x1434	/* DMA enable + per-ring TX kick (bit0 = ring0)	*/
-#define R_IO_CMD1	0x1438
 
 /* engine enable values (inherited-config + DMA-enable edge) */
+/* MSR(0x58) top byte.  Live working stock runs 0xf0 (FORCE_TRXFCE|RXFCE|TXFCE:
+ * flow control FORCED on the internal GMAC<->switch links).
+ *
+ * ★★ HW-PROVEN ON THE SIBLING CHIP (RTL9602C, 2026-06-12): with our MINIMAL
+ * init, 0xf0 STALLS the LAN datapath (ping 0/60) while 0x10 keeps it healthy
+ * (40/40).  Stock tolerates 0xf0 because its FULL init configures flow control
+ * properly; ours does not, so 0xf0's forced pause-frame handling wedges the
+ * MAC.  It is an init-COMPLETENESS problem, not a value we can simply match.
+ *
+ * ⚠ THIS DRIVER HARDCODED 0xf0 UNTIL 2026-08-28 -- the exact value the other
+ * Luna driver had already measured as harmful.  That is the failure mode the
+ * whole deduplication exists to stop: a repair that lands in one board's copy
+ * of a shared driver and never reaches the others.  The two drivers had no
+ * symbol in common, so nothing could have flagged it.
+ *
+ * ★★ THE A/B WAS RUN ON THIS BOARD, 2026-08-28, AND IT REFUTED THE TRANSFER.
+ * Two cold TFTP boots of the same image, one at 0x10 and one with
+ * `luna_eth.msr_top=0xf0` in bootargs: the LAN answered 5/5 BOTH TIMES.  So
+ * the RTL9602C finding does NOT carry to the RTL9603CVD -- forced flow control
+ * is not what decides this board's datapath, and nobody should re-chase it.
+ *
+ * The default stays 0x10 because it is the only value anyone has MEASURED as
+ * safe on this family and it makes the two sibling drivers agree; it is NOT
+ * claimed as a fix, and on this chip both values were measured equal.
+ *
+ * ⚠ NOTE WHAT THIS ALSO SAYS: the LAN answered at all.  The board's standing
+ * "RX path exhausted" investigation describes a dead LAN->CPU ingress, and on
+ * this date that path carries pings on both settings -- so that document is
+ * either stale or the fault is intermittent.  Re-verify it before building on
+ * it; do not read this comment as "RX is fixed".
+ */
+static unsigned int msr_top = 0x10;
+module_param(msr_top, uint, 0644);
+MODULE_PARM_DESC(msr_top, "MSR(0x58) top byte (0x10 = healthy with our init; 0xf0 = stock's value, MEASURED to stall the LAN on the RTL9602C)");
+
 #define IO_CMD_ENABLE	0xc059f130
 #define IO_CMD1_ENABLE	0x32000001
-#define IMR_RX_BITS	0xf835	/* RX-OK + RX-error + ring descriptor-unavailable */
-#define IMR0_TX_BITS	0x3f	/* per-ring TX completion				*/
 
 /* CPU-tag engine config. CTEN_RX (bit31) makes the MAC strip the 8-byte switch
  * tag in hardware on RX and expose the parsed ingress port in the descriptor;
@@ -281,21 +301,8 @@ MODULE_PARM_DESC(cpu_no_loopback, "drop the CPU port from its own egress flood (
 #define ABLTY_CPU_FORCE	0xBFFF		/* CPU-port forced-ability mode (keep)	*/
 
 /* descriptor flags (word0 / opts1, both rings) */
-#define D_OWN		BIT(31)	/* 1 = owned by the DMA engine			*/
-#define D_EOR		BIT(30)	/* end of ring (wrap)				*/
-#define D_FS		BIT(29)	/* first segment				*/
-#define D_LS		BIT(28)	/* last segment					*/
-#define D_TXCRC		BIT(23)	/* TX: append FCS				*/
-#define RXD_CRCERR	BIT(27)
 #define RXD_DMAERR	BIT(24)
-#define RXD_LEN_MASK	0x1fff
-#define TXD_LEN_MASK	0x1ffff
 
-#define RX_RING_SIZE	64
-#define TX_RING_SIZE	64
-#define RX_BUF_SIZE	2048
-#define TH_ON_VAL	0x10	/* RX flow-control assert / de-assert thresholds	*/
-#define TH_OFF_VAL	0x30
 
 /* ---- switch core (SWCORE), phys 0x1b000000 ---------------------------------
  * ★ THE BASE IS THE SAME ON BOTH CHIPS AND THAT IS ESTABLISHED, NOT ASSUMED.
@@ -308,17 +315,11 @@ MODULE_PARM_DESC(cpu_no_loopback, "drop the CPU port from its own egress flood (
  * RTL9607C's highest named register sits at 0x42E7C, so the 0x42000 this file
  * used to map was 0xE7C SHORT — a register at the top of the block would have
  * been written into a hole with nothing to read. */
-#define SWCORE_PHYS		0x1b000000UL
-#define SWCORE_SIZE		0x43000
 
 /* -- offsets that are the SAME on every Luna part covered here -------------- */
 #define SW_GPHY_WD		0x00000	/* internal-PHY indirect: write data	*/
 #define SW_GPHY_CMD		0x00004	/*   ... command (phy<<16 | ocp)		*/
 #define SW_GPHY_RD		0x00008	/*   ... read data + BUSY		*/
-#define SW_LUT_UNKN_SA		0x1C004	/* unknown-SA action, 2 bits/port	*/
-#define SW_LUT_BC_FLOOD		0x1C028	/* broadcast flood, 1 bit/port		*/
-#define SW_LUT_UNKN_MC_FLOOD	0x1C02C
-#define SW_LUT_UNKN_UC_FLOOD	0x1C030
 #define   STP_STATE_MASK	0x3
 #define   STP_FORWARDING	0x3
 
@@ -332,34 +333,40 @@ MODULE_PARM_DESC(cpu_no_loopback, "drop the CPU port from its own egress flood (
 struct luna_eth_chip {
 	const char *name;
 
+	/* ★ The switch-core map for THIS chip -- and the ONLY home of this
+	 * chip's port numbers.  They were briefly duplicated here AND in
+	 * luna_sw_map (2026-08-28, by the same change that tabulated them for
+	 * the sibling driver); the two agreed, which is luck and not structure.
+	 * Two copies of one silicon fact is how they come to disagree in silence.  Kept as a pointer into
+	 * luna_eth_regs.h rather than copied in, so the sibling driver and
+	 * this one read the SAME numbers and a correction lands once. */
+	const struct luna_sw_map *sw_map;
+
 	/* --- switch port map ------------------------------------------------ */
-	u8	cpu_port;	/* the port this GMAC is				*/
-	u8	pon_port;	/* the fibre port (no copper PHY behind it)	*/
 	/* ★ Force the PON port's MAC link like the CPU port's -- 1 only on a
 	 * chip where STOCK was MEASURED doing it. See the write site. */
 	u8	force_pon_ablty;
 	u8	last_port;	/* highest port to iterate, INCLUSIVE		*/
 	u8	n_copper;	/* copper PHY ports, always 0..n_copper-1	*/
 	u8	gphy_ports;	/* bitmap: ports whose PHY is a GPHY, not FE	*/
-	u32	port_mask;	/* flood/member mask covering 0..last_port	*/
 
 	/* --- switch registers that MOVED ------------------------------------ */
-	u32	force_ablty;	/* + 4*port: forced ability values		*/
-	u32	p_ablty;	/* + 4*port: LIVE ability, read-only		*/
-	u32	ablty_force;	/* + 4*port: which ability fields are forced	*/
+	/* force_ablty MOVED to luna_sw_map (via ->sw_map) */	/* + 4*port: forced ability values		*/
+	/* p_ablty MOVED to luna_sw_map (via ->sw_map) */	/* + 4*port: LIVE ability, read-only		*/
+	/* ablty_force MOVED to luna_sw_map (via ->sw_map) */	/* + 4*port: which ability fields are forced	*/
 	u32	msti_ctrl;	/* + 4*port: per-port spanning-tree state	*/
-	u32	src_permit;	/* source-port egress FILTER ENABLE (want 0)	*/
 	u32	cpu_tag_insert;
 	u32	cpu_tag_aware;
 	u32	swcore_rst;	/* swcore soft reset (bit10), excludes cfg	*/
-	u32	gphy_misc;	/* WRAP_GPHY_MISC: bit0 = PHY patch done	*/
+	/* gphy_misc MOVED to luna_sw_map (reached via ->sw_map): the RTL9602C
+	 * driver needs the same fact and a second home is how the two come to
+	 * disagree.  Same reasoning, and the same fix, as the port numbers. */
 	u32	fephy_poll;	/* 0 on a chip with no FE-PHY auto-poller	*/
 	u32	cfg_phy_ini;	/* per-port PHY enable; U-Boot loads it from efuse*/
 	u32	cfg_phy_ctrl;	/* MSK_MDI[8:5] | BASE_PHYAD[4:0]; 0 = not known */
 	u32	cfg_pcsxf;	/* RST_RXFIFO[13:10] | MIIRX_IPG[9:5] | PCSXF[4:1] */
 
 	/* --- port-isolation packing, which differs in SHAPE not just offset -- */
-	u32	piso_base;
 	u8	piso_per_word;	/* how many ports share one 32-bit word		*/
 	u8	piso_bits;	/* width of one port's mask			*/
 	u32	piso_all;	/* the all-open value for ONE port		*/
@@ -367,7 +374,6 @@ struct luna_eth_chip {
 	/* --- SerDes uplink: present only on the bigger part ------------------ */
 	u32	serdes_linemode;	/* 0 = no SerDes on this chip		*/
 	u32	force_ablty_x;		/* SerDes/PBO ability trio, 0 if absent	*/
-	u32	p_ablty_x;
 	u32	ablty_force_x;
 	u32	sds_fib_status;		/* + 0x20*idx, 0 if absent		*/
 
@@ -383,9 +389,8 @@ struct luna_eth_chip {
  * not of the new chip.
  * --------------------------------------------------------------------------- */
 static const struct luna_eth_chip luna_chip_rtl9607c = {
+	.sw_map		= &rtl9607c_sw_map,
 	.name		= "RTL9607C",
-	.cpu_port	= 9,
-	.pon_port	= 5,
 	/* ⚠ 0 DELIBERATELY, and it is a scope statement rather than a
 	 * finding: nobody has diffed SWCORE 0x1cc/0x238 stock-vs-ours on the
 	 * RTL9607C engineering board, and this chip reaches its PON/PBO
@@ -397,25 +402,17 @@ static const struct luna_eth_chip luna_chip_rtl9607c = {
 	.last_port	= 11,	/* 0..4,8 copper; 5 PON; 6,7 SerDes; 9 CPU; 11 PBO */
 	.n_copper	= 5,	/* ports 0..4 */
 	.gphy_ports	= 0x1f,	/* all five copper ports are GPHYs here	*/
-	.port_mask	= GENMASK(9, 0),
-	.force_ablty	= 0x001CC,
-	.p_ablty	= 0x00200,
-	.ablty_force	= 0x00238,
 	.msti_ctrl	= 0x1704C,
-	.src_permit	= 0x1C114,
 	.cpu_tag_insert	= 0x230F4,
 	.cpu_tag_aware	= 0x230F8,
 	.swcore_rst	= 0x00108,
-	.gphy_misc	= 0x00114,
 	.fephy_poll	= 0,	/* every PHY here is a GPHY: no FE auto-poller	*/
 	.cfg_phy_ini	= 0x0004C,
-	.piso_base	= 0x27000,
 	.piso_per_word	= 1,
 	.piso_bits	= 29,
 	.piso_all	= 0x1FFFFFFF,
 	.serdes_linemode = 0x00084,
 	.force_ablty_x	= 0x002F4,
-	.p_ablty_x	= 0x002F8,
 	.ablty_force_x	= 0x002FC,
 	.sds_fib_status	= 0x0028C,
 	.sys_status	= 0,
@@ -450,9 +447,8 @@ static const struct luna_eth_chip luna_chip_rtl9607c = {
  * port that "links but forwards nothing" is what forgetting it looks like.
  * --------------------------------------------------------------------------- */
 static const struct luna_eth_chip luna_chip_rtl9603cvd = {
+	.sw_map		= &rtl9603cvd_sw_map,
 	.name		= "RTL9603CVD",
-	.cpu_port	= 5,
-	.pon_port	= 4,
 	/* ★★ MEASURED 2026-08-27, stock vs ours, SWCORE 0x180..0x1fc
 	 * (swcore_diff.py --board=RTL9603CVD/LANLY/G24W --diff):
 	 *     FORCE_P_ABLTY[4]     stock 0x00000016   ours 0x00000000
@@ -465,27 +461,19 @@ static const struct luna_eth_chip luna_chip_rtl9603cvd = {
 	.last_port	= 5,	/* 0..2 FE; 3 GE; 4 PON; 5 CPU (6 = PBO loopback)*/
 	.n_copper	= 4,	/* ports 0..3					*/
 	.gphy_ports	= 0x08,	/* ONLY port 3 is a GPHY; 0..2 are FE PHYs	*/
-	.port_mask	= GENMASK(5, 0),
-	.force_ablty	= 0x00198,
-	.p_ablty	= 0x001B8,
-	.ablty_force	= 0x001DC,
 	.msti_ctrl	= 0x1713C,
-	.src_permit	= 0x1C0B0,
 	.cpu_tag_insert	= 0x2303C,
 	.cpu_tag_aware	= 0x23040,
 	.swcore_rst	= 0x000E0,
-	.gphy_misc	= 0x000EC,
 	.fephy_poll	= 0x0000C,
 	.cfg_phy_ini	= 0x00050,
 	.cfg_phy_ctrl	= 0x0004C,
 	.cfg_pcsxf	= 0x00048,
-	.piso_base	= 0x27000,
 	.piso_per_word	= 2,
 	.piso_bits	= 12,
 	.piso_all	= 0xFFF,
 	.serdes_linemode = 0,	/* no SerDes on this part			*/
 	.force_ablty_x	= 0,
-	.p_ablty_x	= 0,
 	.ablty_force_x	= 0,
 	.sds_fib_status	= 0,
 	.sys_status	= 0xB8000044,	/* SoC handshake, outside SWCORE		*/
@@ -493,24 +481,17 @@ static const struct luna_eth_chip luna_chip_rtl9603cvd = {
 
 /* Accessors: the table lives in `ep->c`, so a per-port register is one call and
  * a chip that lacks a register is answered with 0 and SKIPPED by the caller. */
-#define SW_FORCE_ABLTY(ep, p)	((ep)->c->force_ablty + (p) * 4)
-#define SW_P_ABLTY(ep, p)	((ep)->c->p_ablty + (p) * 4)
-#define SW_ABLTY_FORCE(ep, p)	((ep)->c->ablty_force + (p) * 4)
+#define SW_FORCE_ABLTY(ep, p)	((ep)->c->sw_map->force_ablty + (p) * 4)
+#define SW_P_ABLTY(ep, p)	((ep)->c->sw_map->p_ablty + (p) * 4)
+#define SW_ABLTY_FORCE(ep, p)	((ep)->c->sw_map->ablty_force + (p) * 4)
 #define SW_MSTI_CTRL(ep, p)	((ep)->c->msti_ctrl + (p) * 4)
 
 /* VLAN: filtering must not gate CPU<->LAN egress (the boot loader may leave it on
  * with the CPU port outside the member set). */
-#define SW_VLAN_CTRL		0x13008
 #define   VLAN_FILTERING	BIT(0)
-#define SW_VLAN_ACCEPT		0x13000	/* per-port accept-frame-type (0 = accept all) */
-#define SW_VLAN_PB_VID		0x1300C	/* per-port default VID (PVID), stride 4	*/
 
 /* Per-port lookup-miss (unknown-DA) action, 2 bits/port; 0 = FORWARD. Needed for
  * the post-ARP unicast / IPv6-ND path (the first broadcast already floods). */
-#define SW_UNKN_UC_DA		0x1C00C
-#define SW_UNKN_L2_MC		0x1C018
-#define SW_UNKN_IP4_MC		0x1C01C
-#define SW_UNKN_IP6_MC		0x1C020
 #define   DA_ACT_PORTS		0x3FFFFF	/* ports 0..10, 2 bits each		*/
 
 #define ABLTY_1G_FULL_LINK	0x16	/* speed=1000, duplex=full, link=up	*/
@@ -535,12 +516,8 @@ static const struct luna_eth_chip luna_chip_rtl9603cvd = {
 #define RTL_CPU_TAG_LEN		8
 #define RTL_CPU_TAG_ETYPE	0x8899
 
-/* SoC peripheral control (fixed uncached KSEG1, no ioremap) */
-#define SOC_IP_SEL	((void __iomem *)0xb8000600ul)	/* per-engine clock/reset*/
-#define   IPSEL_GMAC0	BIT(1)
-#define SOC_SW_ENABLE	((void __iomem *)0xb800063cul)	/* switch-core enable	*/
-#define   SW_EN_BIT	BIT(5)
-#define   SW_PBO_BIT	BIT(25)				/* required on rev > A	*/
+/* SOC_SW_ENABLE and its bits are the FAMILY's -- luna_eth_regs.h, which
+ * also records that this driver and gpon-rtl960x.c name bit 5 differently. */
 
 /* Internal-PHY indirect window. The register TRIO and its bit layout are the
  * same on both chips (declared at the top with the other shared offsets); the
@@ -598,10 +575,11 @@ static const struct luna_eth_chip luna_chip_rtl9603cvd = {
 #define MII_LSTATUS	0x0004
 
 /* The DMA descriptor address bus window (0 on this SoC). */
-#define DMA_BUS_WINDOW	0u
+/* DMA_BUS_WINDOW is the FAMILY's -- luna_eth_regs.h, with the measurement
+ * that explains why it is zero and must stay a named knob. */
 
-struct rx_desc { u32 opts1, addr, opts2, opts3; };
-struct tx_desc { u32 opts1, addr, opts2, opts3, opts4; };
+/* struct rx_desc / struct tx_desc are the FAMILY's -- luna_eth_regs.h.
+ * They were declared identically in both drivers; one type now. */
 
 struct luna_eth {
 	const struct luna_eth_chip *c;	/* THE per-chip table -- never an #ifdef */
@@ -972,7 +950,7 @@ static void eth_copper_phy_up(struct luna_eth *ep)
 		bmcr |= MII_ANENABLE | MII_ANRESTART;	/* auto-neg + restart	*/
 		gphy_write(ep, p, 0, bmcr);
 	}
-	sw_or(ep, ep->c->gphy_misc, BIT(0));		/* patch-done sticky	*/
+	sw_or(ep, ep->c->sw_map->gphy_misc, BIT(0));		/* patch-done sticky	*/
 
 	/* ★ THE SETTLE THIS DRIVER NEVER SPENT. The RTL9603CVD's own U-Boot sets
 	 * the same patch-done bit and then waits 800 ms before touching the PHYs
@@ -1055,59 +1033,32 @@ static void eth_diag_timer(struct timer_list *t)
 }
 
 /* ---- station address ------------------------------------------------------ */
-/* The address the silicon/bootloader leaves in IDR0/IDR4 when nothing has
- * programmed a real one. It is a VALID unicast address, which is exactly why it
- * has to be named: `is_valid_ether_addr()` accepts it and the random fallback
- * would never fire. MEASURED on the LANLY G24W (2026-08-20). */
-static const u8 luna_default_mac[ETH_ALEN] = {
-	0x00, 0xe0, 0x4c, 0x86, 0x70, 0x01
-};
+/* The bring-up default and its predicate are FAMILY facts and live in
+ * luna_eth_regs.h.  They were defined here first; the copy was removed on
+ * 2026-08-28 after the RTL9602C driver was found shipping that very address,
+ * because its own byte-identical IDR reader had never received this refusal. */
 
-static bool luna_mac_is_default(const u8 *mac)
-{
-	return ether_addr_equal(mac, luna_default_mac);
-}
-
+/* Thin wrappers over the family helpers, kept at their own names so the call
+ * sites and this diff stay small. The BODIES live in luna_eth_regs.h. */
 static void eth_get_hwaddr(struct luna_eth *ep, u8 *mac)
 {
-	u32 lo = ep_rd(ep, R_IDR0), hi = ep_rd(ep, R_IDR4);
-
-	mac[0] = lo >> 24; mac[1] = lo >> 16; mac[2] = lo >> 8; mac[3] = lo;
-	mac[4] = hi >> 24; mac[5] = hi >> 16;
+	luna_idr_get(ep->base, mac);
 }
 
 static void eth_set_hwaddr(struct luna_eth *ep, const u8 *mac)
 {
-	ep_wr(ep, R_IDR0, ((u32)mac[0] << 24) | ((u32)mac[1] << 16) |
-			  ((u32)mac[2] << 8) | mac[3]);
-	ep_wr(ep, R_IDR4, ((u32)mac[4] << 24) | ((u32)mac[5] << 16));
+	luna_idr_set(ep->base, mac);
 }
 
 /* ---- rings ---------------------------------------------------------------- */
 /* Allocate a fresh RX skb, stream-map it, and arm the descriptor on it. */
+/* The body is the FAMILY's (luna_eth_regs.h): both drivers had it character
+ * for character apart from the struct that reached `->rx_ring`.  The wrapper
+ * keeps the old name and signature so every call site is untouched. */
 static int eth_refill(struct luna_eth *ep, unsigned int idx)
 {
-	struct sk_buff *skb = netdev_alloc_skb(ep->ndev, RX_BUF_SIZE);
-	dma_addr_t da;
-	u32 opts1;
-
-	if (!skb)
-		return -ENOMEM;
-	da = dma_map_single(ep->dev, skb->data, RX_BUF_SIZE, DMA_FROM_DEVICE);
-	if (dma_mapping_error(ep->dev, da)) {
-		dev_kfree_skb_any(skb);
-		return -ENOMEM;
-	}
-	ep->rx_skb[idx] = skb;
-	ep->rx_buf_dma[idx] = da;
-	ep->rx_ring[idx].addr = da | DMA_BUS_WINDOW;
-	ep->rx_ring[idx].opts2 = 0;
-	ep->rx_ring[idx].opts3 = 0;
-	opts1 = D_OWN | RX_BUF_SIZE;
-	if (idx == RX_RING_SIZE - 1)
-		opts1 |= D_EOR;
-	ep->rx_ring[idx].opts1 = opts1;
-	return 0;
+	return luna_rx_refill(ep->ndev, ep->dev, ep->rx_ring, ep->rx_skb,
+				 ep->rx_buf_dma, idx, RX_RING_SIZE, RX_BUF_SIZE);
 }
 
 static void eth_free_rings(struct luna_eth *ep)
@@ -1221,8 +1172,8 @@ static void eth_switch_init(struct luna_eth *ep)
 		eth_rtl8221b_reset_release(ep);
 
 	/* 4. open the L2 forwarding plane. */
-	for (p = 0; p <= ep->c->cpu_port; p++) {
-		u32 reg = SW_LUT_UNKN_SA + (p / 16) * 4;
+	for (p = 0; p <= ep->c->sw_map->cpu_port; p++) {
+		u32 reg = ep->c->sw_map->lut_unkn_sa + (p / 16) * 4;
 
 		/* unknown-source-MAC action 0 = learn + forward */
 		sw_wr(ep, reg, sw_rd(ep, reg) & ~(3u << ((p % 16) * 2)));
@@ -1240,13 +1191,13 @@ static void eth_switch_init(struct luna_eth *ep)
 	 * board sees the identical write it saw before.
 	 */
 	{
-		u32 flood = ep->c->port_mask;
+		u32 flood = ep->c->sw_map->port_mask;
 
 		if (ep->c->force_pon_ablty)
-			flood &= ~BIT(ep->c->pon_port);
-		sw_or(ep, SW_LUT_BC_FLOOD, flood);
-		sw_or(ep, SW_LUT_UNKN_MC_FLOOD, flood);
-		sw_or(ep, SW_LUT_UNKN_UC_FLOOD, flood);
+			flood &= ~BIT(ep->c->sw_map->pon_port);
+		sw_or(ep, ep->c->sw_map->bc_flood, flood);
+		sw_or(ep, ep->c->sw_map->unkn_mc_flood, flood);
+		sw_or(ep, ep->c->sw_map->unkn_uc_flood, flood);
 	}
 	/* SW_SRC_PORT_PERMIT (0x1C114) is a per-source-port EGRESS-FILTER ENABLE
 	 * (EN, 1 bit/port), NOT a permit bitmap: EN=1 turns on source-port egress
@@ -1254,16 +1205,16 @@ static void eth_switch_init(struct luna_eth *ep)
 	 * working firmware leaves it 0 (no filtering = forward). Writing all-ones here
 	 * silently dropped every LAN->CPU frame (port RX climbed, CPU RX stayed flat).
 	 * Correct forwarding-permissive value is 0. */
-	sw_wr(ep, ep->c->src_permit, 0x00000000);
+	sw_wr(ep, ep->c->sw_map->src_permit, 0x00000000);
 
 	/* 4a2. per-port unknown-DA lookup-miss action = FORWARD(0). We only set the
 	 *      unknown-SOURCE action above; the unknown-DESTINATION action must also
 	 *      forward, else post-ARP unicast / IPv6-ND to a not-yet-learned MAC is
 	 *      dropped instead of flooded. Clear the 2-bit field for ports 0..10. */
-	sw_wr(ep, SW_UNKN_UC_DA,  sw_rd(ep, SW_UNKN_UC_DA)  & ~DA_ACT_PORTS);
-	sw_wr(ep, SW_UNKN_L2_MC,  sw_rd(ep, SW_UNKN_L2_MC)  & ~DA_ACT_PORTS);
-	sw_wr(ep, SW_UNKN_IP4_MC, sw_rd(ep, SW_UNKN_IP4_MC) & ~DA_ACT_PORTS);
-	sw_wr(ep, SW_UNKN_IP6_MC, sw_rd(ep, SW_UNKN_IP6_MC) & ~DA_ACT_PORTS);
+	sw_wr(ep, ep->c->sw_map->lut_unkn_uc_da,  sw_rd(ep, ep->c->sw_map->lut_unkn_uc_da)  & ~DA_ACT_PORTS);
+	sw_wr(ep, ep->c->sw_map->unkn_l2_mc,  sw_rd(ep, ep->c->sw_map->unkn_l2_mc)  & ~DA_ACT_PORTS);
+	sw_wr(ep, ep->c->sw_map->unkn_ip4_mc, sw_rd(ep, ep->c->sw_map->unkn_ip4_mc) & ~DA_ACT_PORTS);
+	sw_wr(ep, ep->c->sw_map->unkn_ip6_mc, sw_rd(ep, ep->c->sw_map->unkn_ip6_mc) & ~DA_ACT_PORTS);
 
 	/* 4a3. VLAN must not gate CPU<->LAN egress. The boot loader can leave VLAN
 	 *      filtering ON with the CPU port outside the member set, which silently
@@ -1297,9 +1248,9 @@ static void eth_switch_init(struct luna_eth *ep)
 	 * read-modify-write is therefore mandatory -- a plain store would wipe
 	 * the neighbouring port's mask on the chip that shares a word. */
 	if (cpu_no_loopback) {
-		unsigned int cp = ep->c->cpu_port;
+		unsigned int cp = ep->c->sw_map->cpu_port;
 		unsigned int per = ep->c->piso_per_word;
-		u32 reg = ep->c->piso_base + (cp / per) * 4;
+		u32 reg = ep->c->sw_map->piso_base + (cp / per) * 4;
 		unsigned int shift = (cp % per) * ep->c->piso_bits;
 		u32 fld = ep->c->piso_all & ~BIT(cp);
 
@@ -1314,7 +1265,7 @@ static void eth_switch_init(struct luna_eth *ep)
 	 *    link bit, so we don't disturb the working internal link (clobbering it
 	 *    can stop the switch egressing CPU-injected frames). */
 	for (p = 0; p <= ep->c->last_port; p++) {
-		if (p == ep->c->cpu_port) {
+		if (p == ep->c->sw_map->cpu_port) {
 			sw_or(ep, SW_FORCE_ABLTY(ep, p), BIT(4));
 			sw_wr(ep, SW_ABLTY_FORCE(ep, p), ABLTY_CPU_FORCE);
 		} else {
@@ -1383,7 +1334,7 @@ static void eth_switch_init(struct luna_eth *ep)
 	 * MAC behind it, which is why it is repaired now rather than after.
 	 */
 	if (ep->c->force_pon_ablty) {
-		unsigned int pp = ep->c->pon_port;
+		unsigned int pp = ep->c->sw_map->pon_port;
 		u32 was = sw_rd(ep, SW_FORCE_ABLTY(ep, pp));
 
 		sw_wr(ep, SW_FORCE_ABLTY(ep, pp), ABLTY_1G_FULL_LINK);
@@ -1404,34 +1355,28 @@ static void eth_switch_init(struct luna_eth *ep)
 
 	dev_info(ep->dev,
 		 "switch: %s open-L2 up (cpu-port %u of 0..%u, src-permit=%08x, cpu-ablty=%04x)\n",
-		 ep->c->name, ep->c->cpu_port, ep->c->last_port,
-		 sw_rd(ep, ep->c->src_permit),
-		 sw_rd(ep, SW_P_ABLTY(ep, ep->c->cpu_port)));
+		 ep->c->name, ep->c->sw_map->cpu_port, ep->c->last_port,
+		 sw_rd(ep, ep->c->sw_map->src_permit),
+		 sw_rd(ep, SW_P_ABLTY(ep, ep->c->sw_map->cpu_port)));
 	/* Baseline real-link snapshot; the periodic diag (armed at open) then shows
 	 * which port's genuine link comes up + rxpkts climb under host traffic. */
 	eth_diag_dump(ep);
 }
 
 /* ---- MAC engine ----------------------------------------------------------- */
+/* The body is the family's (luna_eth_regs.h): both drivers had it, identical
+ * but for the struct that reached `->base`. */
 static void eth_hw_stop(struct luna_eth *ep)
 {
-	ep_wr(ep, R_IO_CMD, 0);
-	ep_wr(ep, R_IO_CMD1, 0);
-	iowrite16(0, ep->base + R_IMR);
-	ep_wr(ep, R_IMR0, 0);
-	iowrite16(0xffff, ep->base + R_ISR);
-	ep_wr(ep, R_ISR1, 0xffffffff);
-	udelay(10);
+	luna_eth_hw_stop(ep->base);
 }
 
 /* GMAC0 IP-block power-cycle: the multi-ring fetch engine only latches its ring
  * state across this reset edge, so it must run before the descriptor program. */
+/* The body and the hang warning are the FAMILY's (luna_eth_regs.h). */
 static void eth_ipsel_cycle(void)
 {
-	writel(readl(SOC_IP_SEL) & ~IPSEL_GMAC0, SOC_IP_SEL);
-	msleep(12);
-	writel(readl(SOC_IP_SEL) | IPSEL_GMAC0, SOC_IP_SEL);
-	msleep(2);
+	luna_ipsel_cycle_gmac0();
 }
 
 static void eth_hw_program(struct luna_eth *ep)
@@ -1480,8 +1425,10 @@ static void eth_hw_program(struct luna_eth *ep)
 			ep_wr(ep, R_RRING_ROUTE + k * 4, 0);
 	}
 
-	/* force the internal MAC<->switch link flow-control (top byte of MSR). */
-	ep_wr(ep, R_MSR, (ep_rd(ep, R_MSR) & 0x00ffffff) | 0xf0000000);
+	/* MSR(0x58) top byte -- see the msr_top param note.  0xf0 is stock's
+	 * value and it WEDGES our datapath. */
+	ep_wr(ep, R_MSR,
+	      (ep_rd(ep, R_MSR) & 0x00ffffff) | ((msr_top & 0xffu) << 24));
 	eth_set_hwaddr(ep, ep->ndev->dev_addr);
 	ep_wr(ep, R_MAR0, 0xffffffff);
 	ep_wr(ep, R_MAR4, 0xffffffff);
@@ -1749,15 +1696,9 @@ static netdev_tx_t eth_xmit(struct sk_buff *skb, struct net_device *ndev)
 static void eth_set_rx_mode(struct net_device *ndev)
 {
 	struct luna_eth *ep = netdev_priv(ndev);
-	u32 rcr = ep_rd(ep, R_RCR);
 
-	/* a bridge enslaving eth0 sets promisc; accept-all-physical (RCR bit0)
-	 * is then required to receive LAN-client frames whose DA != our MAC. */
-	if (ndev->flags & (IFF_PROMISC | IFF_ALLMULTI))
-		rcr |= BIT(0);
-	else
-		rcr &= ~BIT(0);
-	ep_wr(ep, R_RCR, rcr);
+	luna_eth_set_promisc(ep->base,
+				 !!(ndev->flags & (IFF_PROMISC | IFF_ALLMULTI)));
 }
 
 /* Parse "xx:xx:xx:xx:xx:xx" into `out`. -> true on success.
@@ -1766,21 +1707,6 @@ static void eth_set_rx_mode(struct net_device *ndev)
  * refuses a multicast or all-zero address: a malformed parameter must leave the
  * fallback chain intact rather than half-programme an interface.
  */
-static bool mac_addr_from_param(const char *s, u8 *out)
-{
-	u8 v[ETH_ALEN];
-	int n;
-
-	if (!s || !*s)
-		return false;
-	n = sscanf(s, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-		   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
-	if (n != ETH_ALEN || !is_valid_ether_addr(v))
-		return false;
-	memcpy(out, v, ETH_ALEN);
-	return true;
-}
-
 static int eth_set_mac_address(struct net_device *ndev, void *addr)
 {
 	struct luna_eth *ep = netdev_priv(ndev);
@@ -1894,7 +1820,7 @@ static int luna_eth_probe(struct platform_device *pdev)
 	ep->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(ep->base))
 		return PTR_ERR(ep->base);
-	ep->sw = devm_ioremap(dev, SWCORE_PHYS, SWCORE_SIZE);
+	ep->sw = devm_ioremap(dev, SWCORE_PHYS, ep->c->sw_map->swcore_size);
 	if (!ep->sw)
 		return -ENOMEM;
 
@@ -1923,7 +1849,7 @@ static int luna_eth_probe(struct platform_device *pdev)
 	 * so recovering it is flash-reading work, and OWED. Until then a unique
 	 * wrong address beats a shared one.
 	 */
-	if (mac_param && mac_addr_from_param(mac_param, mac)) {
+	if (mac_param && luna_mac_from_param(mac_param, mac)) {
 		/* ★ FIRST RUNG, and it is the only one that can carry a PER-UNIT
 		 * value on this product today. Announced, because a MAC that
 		 * arrived from outside the device must be auditable in the log. */
@@ -1931,7 +1857,7 @@ static int luna_eth_probe(struct platform_device *pdev)
 		dev_info(dev, "MAC %pM taken from the `mac=` boot parameter\n", mac);
 	} else if (of_get_ethdev_address(dev->of_node, ndev)) {
 		eth_get_hwaddr(ep, mac);
-		if (is_valid_ether_addr(mac) && !luna_mac_is_default(mac)) {
+		if (is_valid_ether_addr(mac) && !luna_mac_is_bringup_default(mac)) {
 			eth_hw_addr_set(ndev, mac);
 		} else {
 			eth_hw_addr_random(ndev);

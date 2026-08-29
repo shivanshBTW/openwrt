@@ -38,6 +38,9 @@
 #include <linux/delay.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include "luna_eth_regs.h"	/* the family MAC/switch register map + per-chip table */
+#include "gpon_omci_core.h"	/* omci_put_be16 + the responder */
+#include "gpon_omci_trace.h"	/* G.988 decode-to-a-buffer for the log */
 #include "gpon_omci_me.h"	/* the common OMCI ME store + context */
 #include <linux/crc32.h>	/* crc32_le for the optional SW OMCI MIC path */
 #include "rtl9602c_gpon_nic.h"
@@ -281,13 +284,6 @@ module_param(recover_rst, uint, 0644);
 MODULE_PARM_DESC(recover_rst, "1=CMD.RST soft-reset recovery instead of the IP-block power-cycle");
 
 /* GMAC register offsets (from the NIC base). */
-#define R_IDR0		0x00	/* MAC[0:3] (native word) */
-#define R_IDR4		0x04	/* MAC[4:5] in [31:16] */
-#define R_TCR		0x40	/* TX control */
-#define R_RCR		0x44	/* RX control */
-#define R_CPUTAGCR	0x48
-#define R_CONFIG	0x4C
-#define R_CPUTAG1CR	0x50
 #define R_TxFDP1	0x1300	/* TX ring0 fetch-descriptor pointer (phys) */
 #define R_TxCDO1	0x1304	/* TX ring0 current-descriptor offset (u16) */
 /* Per-ring TX descriptor pointers. The GMAC has six TX descriptor rings; each
@@ -308,9 +304,6 @@ MODULE_PARM_DESC(recover_rst, "1=CMD.RST soft-reset recovery instead of the IP-b
 #define R_RxMRingCfg(k)	(0x1380 + (k) * 16)	/* RX multiring k config block (stock stride 16) */
 #define R_RxFDP		0x13F0	/* RX ring0 fetch-descriptor pointer (phys) */
 #define R_RxCDO		0x13F4	/* RX ring0 current-descriptor offset */
-#define R_RxDesNum	0x1430	/* RX ring0 size / flow-control thresholds */
-#define R_IO_CMD	0x1434	/* DMA enable + TX kick (rings 0-3 = bits 0-3) */
-#define R_IO_CMD1	0x1438
 /* Live-stock 9602C operating values (read off a running stock ONU at O5). The
  * U-Boot value 0x400f3330 is its polled-TFTP config; the stock OS reprograms
  * IO_CMD/IO_CMD1 after the IP-block reset. Bits[3:0] of IO_CMD stay 0 here (the
@@ -328,8 +321,6 @@ MODULE_PARM_DESC(recover_rst, "1=CMD.RST soft-reset recovery instead of the IP-b
  * on sparse TX. KSEG1 is always mapped on MIPS, so address it directly like
  * pcie-rtl9602c.c does.
  */
-#define SOC_IP_SEL	((void __iomem *)0xb8000600ul)
-#define IPSEL_EN_GMAC0	BIT(1)
 
 /*
  * GMAC0 IRQ block. 0x3c/0x3e are 16-bit (RX/TX mask / status); 0xd0/0xd8 are
@@ -338,25 +329,11 @@ MODULE_PARM_DESC(recover_rst, "1=CMD.RST soft-reset recovery instead of the IP-b
  * IMR=0xf835), so the 16-bit IMR/ISR are accessed via ioread16/iowrite16 at
  * 0x3c/0x3e. Values below are the live-stock operating masks.
  */
-#define R_IMR		0x3c	/* 16-bit RX/TX IRQ mask (stock operating = 0xf835) */
-#define R_ISR		0x3e	/* 16-bit RX/TX IRQ status, write-1-to-clear */
-#define R_IMR0		0xd0	/* 32-bit per-ring TX-completion mask (stock = 0x3f) */
-#define R_ISR1		0xd8	/* 32-bit per-ring TX-completion status, W1C */
-#define IMR_RX_BITS	0xf835	/* RX_OK + RX-err + RDU/RDU2..6 (stock IMR) */
-#define IMR0_TX_BITS	0x3f	/* 6 per-ring TX-completion IRQs (stock IMR0) */
 #define R_RRING_ROUTING1 0x1370	/* RX-ring routing by priority: PRI_n_ROUTE = ring# at nibble n (operational default 0x65432100). 0 => all priorities to ring 0. */
 
 /* Descriptor opts1 bits (shared TX/RX where noted). */
-#define D_OWN		BIT(31)	/* 1 = HW owns */
-#define D_EOR		BIT(30)	/* end of ring (wrap) */
-#define D_FS		BIT(29)	/* first segment */
-#define D_LS		BIT(28)	/* last segment */
 #define D_IPCS		BIT(27)	/* TX: insert IPv4 csum */
-#define D_TXCRC		BIT(23)	/* TX: append FCS */
-#define RXD_CRCERR	BIT(27)	/* RX: CRC error */
 #define RXD_RCDF	BIT(24)	/* RX: DMA error */
-#define RXD_LEN_MASK	0x1fff	/* RX length (low bits of opts1) */
-#define TXD_LEN_MASK	0x1ffff	/* TX length */
 
 /*
  * TX descriptor CPU-tag fields (the GMAC tx_info layout, selected by the GMAC
@@ -380,14 +357,12 @@ MODULE_PARM_DESC(recover_rst, "1=CMD.RST soft-reset recovery instead of the IP-b
  * (an artifact of its 1:1 map). Observed to be a NO-OP for TX egress and to
  * DEGRADE RX (Linux dma_alloc_coherent already yields correct bus addrs;
  * OR-ing the window corrupts them). Set 0 to disable — kept as a named knob. */
-#define DMA_BUS_WINDOW	0x00000000u
+/* DMA_BUS_WINDOW is the FAMILY's -- luna_eth_regs.h, with the measurement
+ * that explains why it is zero and must stay a named knob. */
 
-#define RX_RING_SIZE	64
-#define TX_RING_SIZE	64
 #define OTX_RING_SIZE	8	/* dedicated US-OMCI TX ring (low-rate control) */
 #define OMCI_RESV	2	/* LAN xmit stops this many slots early so the sparse shared-ring OMCI inject always has room (never dropped) */
 #define DUMMY_RING_SIZE	4	/* idle filler armed on the unused HW TX rings (gap rings) */
-#define RX_BUF_SIZE	2048
 #define RX_CPU_PREFIX	2	/* switch CPU-port prepends a 2-byte offset word on RX */
 /*
  * TX_CPUTAG selects the CPU->switch egress method:
@@ -400,44 +375,64 @@ MODULE_PARM_DESC(recover_rst, "1=CMD.RST soft-reset recovery instead of the IP-b
  *       differs from mainline rtl8_4.
  */
 #define TX_CPUTAG	0
-#define TH_ON_VAL	0x10
-#define TH_OFF_VAL	0x30
 #define POLL_INTERVAL	msecs_to_jiffies(2)	/* legacy pure-poll fallback (ep->irq<=0) */
 #define REKICK_INTERVAL	msecs_to_jiffies(100)	/* slow TX-unpark backstop when IRQ-driven */
 
-struct rx_desc { u32 opts1, addr, opts2, opts3; };
-struct tx_desc { u32 opts1, addr, opts2, opts3, opts4; };
+/* struct rx_desc / struct tx_desc are the FAMILY's -- luna_eth_regs.h.
+ * They were declared identically in both drivers; one type now. */
 
 /*
  * SoC switch core (SWCORE), phys 0x1B000000. The switch has 4 ports (0-3); the
  * CPU port (where GMAC0 attaches) is port 3. Flood masks have one bit per port.
  */
-#define SWCORE_PHYS	0x1B000000UL
-#define SWCORE_SIZE	0x40000	/* must cover MIB @0x32000 + PISO @0x27000 (was 0x24000 = too small, those fell outside the ioremap!) */
-#define SW_CPU_PORT		3
 /* per-port forced-ability value + force-mode (RTL9602C register map: base 0x180
  * / 0x1B4, stride 4). FORCE_P_ABLTY holds speed/duplex/link; ABLTY_FORCE_MODE
  * = 0xFFF forces all of them. */
-#define SW_FORCE_P_ABLTY(p)	(0x180 + ((p) << 2))
-#define SW_ABLTY_FORCE_MODE(p)	(0x1B4 + ((p) << 2))
-#define SW_LUT_BC_FLOOD		0x1C020	/* bit[port]: flood broadcast to port */
-#define SW_LUT_UNKN_MC_FLOOD	0x1C024
-#define SW_LUT_UNKN_UC_FLOOD	0x1C028
-#define SW_SRC_PORT_PERMIT	0x1C088	/* RTL9602C L2_SRC_PORT_PERMIT, 1 bit/port; 0 drops ingress.
-					 * WAS 0x1C114 (= QOS_PB_PRI on this chip — WRONG): the CPU
-					 * port's ingress permit was never set, so the fabric dropped
-					 * every CPU-injected frame after DMA (TX counter++ / no egress). */
+/* The BASES are this chip's entry in luna_sw_map now -- a per-chip value
+ * belongs in the table, not in a #define only one driver can see. */
+/* ★ `ep` IS AN EXPLICIT ARGUMENT, not captured from the call site.  The first
+ * cut of this macro read `ep->swm->...` implicitly: it compiled, because every
+ * caller happened to have an `ep`, and it would have broken the first time
+ * somebody used it where the pointer is called anything else -- with an error
+ * naming a variable the macro's own text never mentions. */
+#define SW_FORCE_P_ABLTY(ep, p)	((ep)->swm->force_ablty + ((p) << 2))
+#define SW_ABLTY_FORCE_MODE(ep, p)	((ep)->swm->ablty_force + ((p) << 2))
 #define SW_SYS_LRN_LIMITNO	0x17018	/* system MAC-learn limit [10:0]; 0 = no learning */
-#define SW_LUT_UNKN_UC_DA_CTRL	0x1C008	/* per-port unknown-UC DLF action, 16-bit/port (2-byte stride); ACT[1:0]: 0=fwd 1=drop 2=trap2cpu */
 #define SW_DLF_ACT_TRAP2CPU	2
-#define SW_PISO_PORT		0x27000	/* per-port egress-forward (isolation) mask, 11b/port bit-packed; set bit = may forward to that port. all-1s = no isolation */
 /* Forced ability value: 1000M (speed[1:0]=2) + full duplex (b2) + link-up (b4) */
 #define SW_ABLTY_1G_FD_UP	(0x2 | BIT(2) | BIT(4))
-#define SW_PORTS_ALL		0xf	/* ports 0-3 (incl CPU port 3) */
 /* MAC_CPU_TAG_CTRL: TAG_AWARE[9] makes the switch parse the CPU-tag on CPU-port
  * ingress and STRIP it before physical egress; TRAP_TAGET_INSERT_EN[8] inserts
  * a CPU-tag on frames trapped to the CPU. */
 #define SW_MAC_CPU_TAG_CTRL	0x23030
+/*
+ * ★★ THE THREE "AUX" WORDS ARE FLOW-CONTROL THRESHOLDS, NOT CPU-TAG REGISTERS
+ * (tier 3, 2026-08-29: the RTL9602C's OWN chipdef, rtk_rtl9602c_reg_list.c).
+ * They were written here as magic copied off a working stock board, described
+ * only as "Aux regs (live-stock)", and the family's per-chip table names two of
+ * these very addresses cpu_tag_insert / cpu_tag_aware -- for the RTL9607C.
+ *
+ *   0x23030  MAC_CPU_TAG_CTRL     (this driver already had it right)
+ *   0x230F0  FC_P_LO_TH           per-port flow-control LOW threshold
+ *   0x230F4  FC_P_FCOFF_HI_TH     flow-control OFF, HIGH threshold
+ *   0x230F8  FC_P_FCOFF_LO_TH     flow-control OFF, LOW threshold
+ *   0x23040  CFG_UNHIOL           -- and THIS is why the 9607C names must never
+ *                                    be adopted here: that is where the family
+ *                                    table puts cpu_tag_aware for the 9603CVD.
+ *
+ * Same address, different silicon, different register.  Adopting the sibling's
+ * name would have been the CFG_PHY_CTRL defect again -- our own driver
+ * corrupting a register because a matching number was read as a matching
+ * meaning.
+ *
+ * ⚠ THE VALUES ARE UNCHANGED AND STAY VERBATIM.  Naming a register is not
+ * understanding its value: 0x00400034 / 0x00f000ea / 0x00400034 were measured on
+ * a board that works, and nothing here has yet derived them from page counts.
+ * What changes is that the next reader knows WHAT they configure.
+ */
+#define SW_FC_P_LO_TH		0x230F0
+#define SW_FC_P_FCOFF_HI_TH	0x230F4
+#define SW_FC_P_FCOFF_LO_TH	0x230F8
 #define SW_TAG_AWARE		BIT(9)
 #define SW_TRAP_TAG_INSERT_EN	BIT(8)
 /* VLAN filtering: VLAN_CTRL @ 0x13008 bit0 = VLAN_FILTERING; VLAN_INGRESS @
@@ -445,10 +440,7 @@ struct tx_desc { u32 opts1, addr, opts2, opts3, opts4; };
  * default VLAN; for flat bring-up we DISABLE them so a parsed cpu-tag's directed
  * egress is not dropped by VLAN membership checks (we have no VLAN table set up). */
 #define SW_VLAN_INGRESS		0x13004
-#define SW_VLAN_CTRL		0x13008
 #define SW_VLAN_FILTERING	BIT(0)
-#define SW_VLAN_ACCEPT		0x13000	/* per-port accept-frame-type (0 = accept all) */
-#define SW_VLAN_PB_VID		0x1300C	/* per-port PVID, stride 4; VID = bits[11:0] */
 /* Operational value: VLAN_CTRL=0x19 (filtering + VID0/VID4095 type bits). */
 #define SW_VLAN_CTRL_VAL	0x19	/* VLAN filtering ON at init — required during ranging/config-apply for
 					 * reliable onlining (VLAN-off cold boots failed config-apply 4x; VLAN-on
@@ -472,7 +464,6 @@ struct tx_desc { u32 opts1, addr, opts2, opts3, opts4; };
  * to the CPU port tagged with rx-reason OMCI from the PON port; CPUTAG1CR[14:8]
  * selects which DS stream-id the GMAC traps to the CPU. */
 #define RTL9602C_OMCI_REASON	246	/* RX cpu-tag reason code = OMCI */
-#define RTL9602C_PON_PORT	2	/* PON/fiber switch port */
 #define CPUTAG1_OMCI_SID(s)	(((s) & 0x7f) << 8)	/* R_CPUTAG1CR[14:8] */
 #define CPUTAG1_B1		0x2	/* bit1: live 9602C stock reads CPUTAG1CR=0x4002; not present in the 9607C register map */
 /* Stock NIC init writes CPUTAG1CR = (SID<<8) | 0x70 (bits 4/5/6 = the
@@ -484,6 +475,9 @@ struct tx_desc { u32 opts1, addr, opts2, opts3, opts4; };
 /* The switch L34 (NAPT) offload module is compiled in via this driver's TU to
  * avoid a separate Kbuild object; it carries its own header include guard. */
 #include "rtl9602c_l34.c"
+#ifdef CONFIG_GPON_FLOW_OFFLOAD
+#include "gpon_flow_offload.h"	/* the core TC-offload lifecycle */
+#endif
 
 /* HW NAT (switch L34 offload) gate. Module-param gated (not Kconfig) so it can
  * be toggled without an OpenWrt kernel-config round-trip. Default off: engine
@@ -495,6 +489,13 @@ module_param(hw_nat, int, 0444);
 MODULE_PARM_DESC(hw_nat, "enable RTL9602C switch L34 hardware NAT offload (0=off)");
 
 struct rtl9602c_eth {
+	/* ★ THE PER-CHIP TABLE.  The switch LUT block MOVED between Luna
+	 * revisions, and one chip's constant on another's silicon does not
+	 * fault -- it configures the wrong behaviour (see luna_eth_regs.h).
+	 * Reaching it through a pointer is what lets a shared function body
+	 * exist at all: a body that names a #define is a body that belongs to
+	 * one chip. */
+	const struct luna_sw_map *swm;
 	void __iomem	*base;
 	void __iomem	*sw;	/* switch core */
 	void __iomem	*txgo;	/* network-engine TX-fetch page 0x18001000; +0x38 bit31 = per-packet GO */
@@ -578,6 +579,9 @@ struct rtl9602c_eth {
 	struct napi_struct napi;
 	int		irq;	/* GMAC0 INTC input (platform_get_irq); <=0 = pure-poll fallback */
 	struct rtl9602c_l34 l34;	/* switch L3/L4 (NAPT) hardware-offload engine */
+#ifdef CONFIG_GPON_FLOW_OFFLOAD
+	struct gpon_flow_offload *fo;	/* the COMMON TC lifecycle, drivers/net/gpon/ */
+#endif
 	/* Host uplink port, learned from the RX descriptor src_port_num. All RX
 	 * arrives on the board's single connected LAN port, so this resolves to the
 	 * physical switch port the host is on — we then steer CPU->LAN TX there
@@ -778,19 +782,24 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 	 * is the prerequisite that makes the whole PON-IP US/DS NIC + PBO datapath
 	 * reachable. Our minimal init never touched it (we only ever compared
 	 * 0x18000600..0x624, never 0x63C). Read-modify-write, OR bit5. */
-	writel(readl((void __iomem *)0xb800063cul) | BIT(5),
-	       (void __iomem *)0xb800063cul);
+	/* The family's name, not a bare address: this is the same word and the
+	 * same bit luna_eth.c and gpon-rtl960x.c both set. */
+	writel(readl(SOC_SW_ENABLE) | SW_EN_BIT, SOC_SW_ENABLE);
 
 	/* (b) CFG_UNHIOL.IPG_COMPENSATION — swcore 0x23040 bit0. ORACLE-CONFIRMED real
 	 * value diff (ours read 0xa8, working stock 0xa9) that demonstrably changed the
 	 * OMCI forwarding class when poked live. The stock switch init sets it. */
-	iowrite32(ioread32(ep->sw + 0x23040) | BIT(0), ep->sw + 0x23040);
+	if (ep->swm->cfg_unhiol)
+		iowrite32(ioread32(ep->sw + ep->swm->cfg_unhiol) | BIT(0),
+			  ep->sw + ep->swm->cfg_unhiol);
 
 	/* (c) WRAP_GPHY_MISC.PATCH_PHY_DONE — swcore 0x110 bit0: the "switch ready /
 	 * PHY patch done" latch the stock switch init asserts at completion. Without it
 	 * the switch may not present itself as fully initialised to the direct-TX
 	 * forwarding class. */
-	iowrite32(ioread32(ep->sw + 0x110) | BIT(0), ep->sw + 0x110);
+	if (ep->swm->gphy_misc)
+		iowrite32(ioread32(ep->sw + ep->swm->gphy_misc) | BIT(0),
+			  ep->sw + ep->swm->gphy_misc);
 
 	/* Force CPU port (3) + both LAN ports (0=FE,1=GE) link-up (the switch will
 	 * not egress to a port it thinks is link-down), permit all-port ingress at
@@ -809,19 +818,19 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 	 * Cross-port forwarding (host port1 <-> CPU port3) is unaffected (different
 	 * ports). PISO 0x27000 is an 11-bit positive egress matrix (reset 0x3FFFFF =
 	 * forward to all); leave it at reset — do NOT write 0xffffffff (reserved bits). */
-	iowrite32(0, ep->sw + SW_SRC_PORT_PERMIT);
+	iowrite32(0, ep->sw + ep->swm->src_permit);
 	/* Flood masks: ports 0,1 (LAN) + 3 (CPU), but NOT port 2 (PON). Behavioral note:
 	 * stock excludes the PON port from BC/MC/unknown-UC flood so a cpu-tagged US OMCI
 	 * that the parser did not direct-TX has NO flood escape to switch-p2 — it is forced
 	 * down the PSEL direct-TX path to the US-NIC (our measured symptom was OMCI
 	 * L2-flooding to p2 instead). LAN/CPU flood (host BC/ARP/DHCP reach the CPU) is
 	 * preserved; DS ingress from p2 and directed US GEM data are unaffected. */
-	iowrite32((ioread32(ep->sw + SW_LUT_BC_FLOOD) | SW_PORTS_ALL) & ~BIT(RTL9602C_PON_PORT),
-		  ep->sw + SW_LUT_BC_FLOOD);
-	iowrite32((ioread32(ep->sw + SW_LUT_UNKN_MC_FLOOD) | SW_PORTS_ALL) & ~BIT(RTL9602C_PON_PORT),
-		  ep->sw + SW_LUT_UNKN_MC_FLOOD);
-	iowrite32((ioread32(ep->sw + SW_LUT_UNKN_UC_FLOOD) | SW_PORTS_ALL) & ~BIT(RTL9602C_PON_PORT),
-		  ep->sw + SW_LUT_UNKN_UC_FLOOD);
+	iowrite32((ioread32(ep->sw + ep->swm->bc_flood) | ep->swm->port_mask) & ~BIT(ep->swm->pon_port),
+		  ep->sw + ep->swm->bc_flood);
+	iowrite32((ioread32(ep->sw + ep->swm->unkn_mc_flood) | ep->swm->port_mask) & ~BIT(ep->swm->pon_port),
+		  ep->sw + ep->swm->unkn_mc_flood);
+	iowrite32((ioread32(ep->sw + ep->swm->unkn_uc_flood) | ep->swm->port_mask) & ~BIT(ep->swm->pon_port),
+		  ep->sw + ep->swm->unkn_uc_flood);
 	/* Unknown-unicast that misses the L2 lookup (e.g. the host's NDP/ARP
 	 * reply to the not-yet-learned CPU MAC) must reach the CPU. Flooding via
 	 * uc_flood alone proved ineffective for unicast DLF on this switch, so set
@@ -829,15 +838,15 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 	 * is a 16-bit field at 2-byte stride with ACT in bits[1:0]; one 32-bit
 	 * write covers two ports. */
 	iowrite32((SW_DLF_ACT_TRAP2CPU << 16) | SW_DLF_ACT_TRAP2CPU,
-		  ep->sw + SW_LUT_UNKN_UC_DA_CTRL);		/* ports 0,1 */
+		  ep->sw + ep->swm->lut_unkn_uc_da);		/* ports 0,1 */
 	iowrite32((SW_DLF_ACT_TRAP2CPU << 16) | SW_DLF_ACT_TRAP2CPU,
-		  ep->sw + SW_LUT_UNKN_UC_DA_CTRL + 4);		/* ports 2,3 */
+		  ep->sw + ep->swm->lut_unkn_uc_da + 4);		/* ports 2,3 */
 	/* NOTE: 0x27000 (PISO) is a 5-bit isolation-vector INDEX per port, NOT a
 	 * direct portmask — writing 0xffffffff selected index 0x1f and likely blocked
 	 * CPU->LAN forwarding. The bootloader leaves it at default (TX works), so we
 	 * do too. */
 	/* NOTE: the SWITCH cpu-tag engine writes (MAC_CPU_TAG_CTRL=0x300 TAG_AWARE +
-	 * the 0x230F0/F4/F8 aux) MOVED to rtl9602c_eth_open(), armed BEFORE R_IO_CMD
+	 * the three FC_P_* flow-control thresholds) MOVED to rtl9602c_eth_open(), armed BEFORE R_IO_CMD
 	 * enables TX — mainline rtl8365mb arms the cpu-tag engine before the
 	 * TX/forwarding path; arming it here (post-TX-enable) left CPU-port-3 ingress
 	 * unable to parse the cpu-tagged US OMCI. */
@@ -875,8 +884,8 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 	 * immediately starts RX. The LAN jack ports stay auto-negotiated (real PHYs);
 	 * only the internal MAC<->MAC CPU port must be force-linked.
 	 */
-	iowrite32(SW_ABLTY_1G_FD_UP, ep->sw + SW_FORCE_P_ABLTY(SW_CPU_PORT));
-	iowrite32(0xfff, ep->sw + SW_ABLTY_FORCE_MODE(SW_CPU_PORT));
+	iowrite32(SW_ABLTY_1G_FD_UP, ep->sw + SW_FORCE_P_ABLTY(ep, ep->swm->cpu_port));
+	iowrite32(0xfff, ep->sw + SW_ABLTY_FORCE_MODE(ep, ep->swm->cpu_port));
 
 	/* Accept short (runt) frames on the PON port (2) and CPU port (3). A DS OMCI
 	 * frame is the 48-byte G.988 baseline + headers = ~60 bytes, BELOW the 64-byte
@@ -898,7 +907,7 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 	 * port and the GMAC RX ring stays empty (filled=0) despite the PON-IP DS
 	 * datapath being fully up. Forcing 1000M/FD/LINK opens the PON->CPU path.
 	 */
-	iowrite32(SW_ABLTY_1G_FD_UP, ep->sw + SW_FORCE_P_ABLTY(RTL9602C_PON_PORT));
+	iowrite32(SW_ABLTY_1G_FD_UP, ep->sw + SW_FORCE_P_ABLTY(ep, ep->swm->pon_port));
 	/*
 	 * Force P2 link UP (0xfff). This is REQUIRED for the DS path (PON->CPU forward).
 	 * Tested the stock-style auto-link (0xfef, clearing FORCE_LINK_ABLTY) on HW:
@@ -906,23 +915,34 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 	 * fixed (us_rxsid still 0). So the P2 force-link is load-bearing for DS and is
 	 * NOT the US-egress blocker -- do not remove it.
 	 */
-	iowrite32(0xfff, ep->sw + SW_ABLTY_FORCE_MODE(RTL9602C_PON_PORT));
+	iowrite32(0xfff, ep->sw + SW_ABLTY_FORCE_MODE(ep, ep->swm->pon_port));
 }
 
+/* ★ THE FIRST RUNG of the declared precedence (bootarg -> DT/nvmem -> random
+ * LAA), and on this product it is the only one that can carry a PER-UNIT value:
+ * no DTS here declares `mac-address`, and the real address is zlib-compressed
+ * in the vendor MIB.  The suite hands it in from the BOARD's own declaration
+ * (`rig/bootmode.py:_mac_bootarg`, this board's ETH_MAC_BOOTARG).
+ *
+ * ⚠ IT WAS MISSING, AND THAT IS HALF OF WHY THIS BOARD SHIPPED THE FAMILY'S
+ * BRING-UP DEFAULT.  The sibling driver has had this rung since 2026-08-24; the
+ * RTL9602C had no way at all to be told its own address, so refusing the
+ * default without adding this would only have traded a stable wrong address for
+ * an unstable one. */
+static char *mac_param;
+module_param_named(mac, mac_param, charp, 0444);
+MODULE_PARM_DESC(mac, "station MAC handed in at boot, aa:bb:cc:dd:ee:ff");
+
+/* Thin wrappers over the family helpers, kept at their own names so the call
+ * sites and this diff stay small. The BODIES live in luna_eth_regs.h. */
 static void rtl9602c_eth_get_hwaddr(struct rtl9602c_eth *ep, u8 *mac)
 {
-	u32 lo = ep_rd(ep, R_IDR0);
-	u32 hi = ep_rd(ep, R_IDR4);
-
-	mac[0] = lo >> 24; mac[1] = lo >> 16; mac[2] = lo >> 8; mac[3] = lo;
-	mac[4] = hi >> 24; mac[5] = hi >> 16;
+	luna_idr_get(ep->base, mac);
 }
 
 static void rtl9602c_eth_set_hwaddr(struct rtl9602c_eth *ep, const u8 *mac)
 {
-	ep_wr(ep, R_IDR0, ((u32)mac[0] << 24) | ((u32)mac[1] << 16) |
-			  ((u32)mac[2] << 8) | mac[3]);
-	ep_wr(ep, R_IDR4, ((u32)mac[4] << 24) | ((u32)mac[5] << 16));
+	luna_idr_set(ep->base, mac);
 }
 
 /*
@@ -1119,29 +1139,13 @@ static int rtl9602c_eth_set_mac_address(struct net_device *ndev, void *p)
 }
 
 /* Give RX descriptor @idx a fresh buffer and hand it to HW (own=1). */
+/* The body is the FAMILY's (luna_eth_regs.h): both drivers had it character
+ * for character apart from the struct that reached `->rx_ring`.  The wrapper
+ * keeps the old name and signature so every call site is untouched. */
 static int rtl9602c_eth_refill(struct rtl9602c_eth *ep, unsigned int idx)
 {
-	struct sk_buff *skb = netdev_alloc_skb(ep->ndev, RX_BUF_SIZE);
-	dma_addr_t da;
-	u32 opts1;
-
-	if (!skb)
-		return -ENOMEM;
-	da = dma_map_single(ep->dev, skb->data, RX_BUF_SIZE, DMA_FROM_DEVICE);
-	if (dma_mapping_error(ep->dev, da)) {
-		dev_kfree_skb_any(skb);
-		return -ENOMEM;
-	}
-	ep->rx_skb[idx] = skb;
-	ep->rx_buf_dma[idx] = da;
-	ep->rx_ring[idx].addr = da | DMA_BUS_WINDOW;	/* match RxFDP bus window */
-	ep->rx_ring[idx].opts2 = 0;
-	ep->rx_ring[idx].opts3 = 0;
-	opts1 = D_OWN | RX_BUF_SIZE;
-	if (idx == RX_RING_SIZE - 1)
-		opts1 |= D_EOR;
-	ep->rx_ring[idx].opts1 = opts1;
-	return 0;
+	return luna_rx_refill(ep->ndev, ep->dev, ep->rx_ring, ep->rx_skb,
+				 ep->rx_buf_dma, idx, RX_RING_SIZE, RX_BUF_SIZE);
 }
 
 /* ===== M2: G.988 OMCI responder + upstream OMCC TX ======================= */
@@ -1521,7 +1525,7 @@ static int rtl9602c_eth_omci_xmit_ring0(struct rtl9602c_eth *ep, const u8 *omci,
  * Carries GPON WAN user data on the data GEM (the OLT's gem-port-id, gpon_data_gem_port,
  * on internal flow GPON_DATA_FLOW).
  * DS frames de-encapsulated from the data GEM arrive from switch PON port 2 and are demux'd
- * to this netdev in rtl9602c_eth_rx (src_port == RTL9602C_PON_PORT). US frames use the SAME
+ * to this netdev in rtl9602c_eth_rx (src_port == ep->swm->pon_port). US frames use the SAME
  * HW cpu-tag direct-TX descriptor the OMCI path uses, but tx_dst_stream_id = GPON_DATA_FLOW
  * (the US-NIC then stamps the OLT's gem-id via GEM_US_PORT_MAP and routes to the OMCC's
  * T-CONT 16/qid 64 grants). Carrier is held up so netifd runs DHCP; pre-install US frames are
@@ -1940,11 +1944,9 @@ EXPORT_SYMBOL(rtl9602c_eth_omci_selftest);
  * ManagedEntityID): bit (16 - N). (Off-by-one here breaks every discovery GET.) */
 #define OMCI_ATTR_BIT(n)	(1u << (16 - (n)))
 
-static inline void omci_put_be16(u8 *p, u16 v)
-{
-	p[0] = (u8)(v >> 8);
-	p[1] = (u8)(v);
-}
+/* omci_put_be16() is the CORE's, from gpon_omci_core.h.  The copy that used to
+ * sit here was byte-identical to it and existed only because the core's was
+ * `static inline` inside its .c, unreachable from any other unit. */
 
 /* G.988 ME class IDs of the auto-instantiated hardware MEs we present in the
  * MIB-Upload (in addition to the discovery MEs above). */
@@ -2022,16 +2024,29 @@ static void rtl9602c_eth_omci_input(struct rtl9602c_eth *ep, const u8 *msg,
 	if (len < 8)
 		return;
 
-	/* Board-side visibility stays here: WHICH message arrived is a fact
-	 * about this OLT and this link, and the core neither logs nor should.
-	 * Rate-limited on the bulk types so a MIB upload cannot flood. */
+	/* Board-side visibility: WHICH message arrived is a fact about this OLT
+	 * and this link, and the core neither logs nor should.  Rate-limited on
+	 * the bulk types so a MIB upload cannot flood.
+	 *
+	 * ★ THE DECODE IS THE CORE'S (gpon_omci_describe), and this board GAINED
+	 * something by the move: the line used to print MT as a bare number,
+	 * with no message-type NAME and no AR/AK flags.  The Cortina family had
+	 * a richer decode of the SAME PDU -- two implementations of one idea,
+	 * neither aware of the other, and no clone detector could see it because
+	 * they shared not one substring.  There is one now, and it is G.988's.
+	 *
+	 * ⚠ THE POLICY STAYS HERE, and it is the BETTER of the two: Luna limits
+	 * only the bulk types, so a Create or an Alarm is never dropped from the
+	 * log, while the Cortina side rate-limits everything.  The core cannot
+	 * print, so it cannot take this decision away. */
 	if (((msg[2] & 0x1f) != OMCI_MT_GET &&
 	     (msg[2] & 0x1f) != OMCI_MT_MIB_UPLOAD_NX &&
-	     (msg[2] & 0x1f) != OMCI_MT_MIB_UPLOAD) || net_ratelimit())
-		netdev_info(ep->ndev,
-			    "OMCI DS: TID=%02x%02x MT=0x%02x class=%u inst=%u len=%u\n",
-			    msg[0], msg[1], msg[2],
-			    (msg[4] << 8) | msg[5], (msg[6] << 8) | msg[7], len);
+	     (msg[2] & 0x1f) != OMCI_MT_MIB_UPLOAD) || net_ratelimit()) {
+		char det[96];
+
+		gpon_omci_describe(msg, len, det, sizeof(det));
+		netdev_info(ep->ndev, "OMCI DS: %s\n", det);
+	}
 
 	/*
 	 * ★★★ THE G.988 RESPONDER IS THE COMMON ONE (2026-08-27). Operator:
@@ -2161,7 +2176,7 @@ static int rtl9602c_eth_rx(struct rtl9602c_eth *ep, int budget, bool napi_ctx)
 		 * only partial fix re-caught — by fuzz/fuzz_rx.c (ASan). */
 		if (ep->omci_trap_on && len >= RX_CPU_PREFIX + 8 && len <= RX_BUF_SIZE &&
 		    ((((ep->rx_ring[i].opts2 >> 21) & 0xff) == RTL9602C_OMCI_REASON &&
-		      ((ep->rx_ring[i].opts3 >> 16) & 0xf) == RTL9602C_PON_PORT) ||
+		      ((ep->rx_ring[i].opts3 >> 16) & 0xf) == ep->swm->pon_port) ||
 		     /* DS OMCI actually arrives SWITCH-routed (no reason==246): the de-
 		      * encapsulated baseline OMCI rides the GMAC CPU-port behind the 2-byte
 		      * prefix as raw G.988 -> [TID(2)][MT(1)][DevID(1)=0x0a baseline/0x0b
@@ -2222,7 +2237,7 @@ static int rtl9602c_eth_rx(struct rtl9602c_eth *ep, int budget, bool napi_ctx)
 				 * bridge works. (An earlier is_multicast->gpon0 rule mis-sent LAN ARP to
 				 * the WAN and broke 192.168.1.1 reachability.) */
 				if (ep->wan_ndev &&
-				    (sp == RTL9602C_PON_PORT || wan_drain ||
+				    (sp == ep->swm->pon_port || wan_drain ||
 				     ether_addr_equal(dst, ep->wan_ndev->dev_addr)))
 					rdev = ep->wan_ndev;
 				else
@@ -2570,15 +2585,11 @@ static irqreturn_t rtl9602c_eth_isr(int irq, void *dev_id)
  * masks 0, W1C-ack everything, settle). Caller holds tx_lock or is open()
  * before anything runs.
  */
+/* The body is the family's (luna_eth_regs.h): both drivers had it, identical
+ * but for the struct that reached `->base`. */
 static void rtl9602c_hw_stop(struct rtl9602c_eth *ep)
 {
-	ep_wr(ep, R_IO_CMD, 0);
-	ep_wr(ep, R_IO_CMD1, 0);
-	iowrite16(0, ep->base + R_IMR);
-	ep_wr(ep, R_IMR0, 0);
-	iowrite16(0xffff, ep->base + R_ISR);
-	ep_wr(ep, R_ISR1, 0xffffffff);
-	udelay(10);
+	luna_eth_hw_stop(ep->base);
 }
 
 /*
@@ -2624,9 +2635,9 @@ static void rtl9602c_hw_program(struct rtl9602c_eth *ep)
 		iowrite32(0, ep->sw + SW_MAC_CPU_TAG_CTRL);
 		wmb();					/* clear must land before the re-arm edge */
 		iowrite32(sw_tagaware, ep->sw + SW_MAC_CPU_TAG_CTRL);
-		iowrite32(0x00400034, ep->sw + 0x230F0);
-		iowrite32(0x00f000ea, ep->sw + 0x230F4);
-		iowrite32(0x00400034, ep->sw + 0x230F8);
+		iowrite32(0x00400034, ep->sw + SW_FC_P_LO_TH);
+		iowrite32(0x00f000ea, ep->sw + SW_FC_P_FCOFF_HI_TH);
+		iowrite32(0x00400034, ep->sw + SW_FC_P_FCOFF_LO_TH);
 	}
 
 	/* Ring pointers, programmed while IO_CMD==0 (stock order; CDO is
@@ -2671,16 +2682,10 @@ static void rtl9602c_hw_program(struct rtl9602c_eth *ep)
 /* Stock GMAC reset path: GMAC0 IP-block power-cycle. The block
  * is UNREADABLE while gated (MMIO would bus-abort), so callers must fence off
  * the ISR/diag readers first. */
+/* The body and the hang warning are the FAMILY's (luna_eth_regs.h). */
 static void rtl9602c_ipsel_cycle(void)
 {
-	writel(readl(SOC_IP_SEL) & ~IPSEL_EN_GMAC0, SOC_IP_SEL);
-	msleep(12);
-	/* Restore ONLY the GMAC bit. (A trial that also OR'd the stock NIC
-	 * bring-up mask 0x1805 here — taken from a chip-id-0x6266-conditional
-	 * stock path — coincided with a hard SoC hang on this 9602C; sibling
-	 * IP_SEL bits gate other clock domains and are not ours to touch.) */
-	writel(readl(SOC_IP_SEL) | IPSEL_EN_GMAC0, SOC_IP_SEL);
-	msleep(2);
+	luna_ipsel_cycle_gmac0();
 }
 
 /*
@@ -2810,15 +2815,19 @@ static void rtl9602c_uboot_swcore_bringup(struct rtl9602c_eth *ep)
 	for (to = 0; to < 200000 && !(readl(sysstat) & 0x2); to++)
 		udelay(1);
 	/* GPHY analog patch (0x6485 variant only), switch regs 0x10004/0x0/0x4 */
-	iowrite32(0xa0000000, ep->sw + 0x10004);
-	if ((ioread32(ep->sw + 0x10004) & 0xffff) == 0x6485) {
+	iowrite32(0xa0000000, ep->sw + SW_CHIP_INFO);
+	if ((ioread32(ep->sw + SW_CHIP_INFO) & 0xffff) == 0x6485) {
 		iowrite32(0x0000fffb, ep->sw + 0x0);
 		iowrite32(0x0061b844, ep->sw + 0x4);
 		iowrite32(0x0021b906, ep->sw + 0x4);
 		iowrite32(0x0021b906, ep->sw + 0x4);
 	}
-	iowrite32(0x0, ep->sw + 0x10004);
-	iowrite32(1, ep->sw + 0x110);		/* WRAP_GPHY_MISC PATCH_PHY_DONE */
+	iowrite32(0x0, ep->sw + SW_CHIP_INFO);
+	/* the SECOND site of the same register -- from the chip table too, or the
+	 * conversion would be half done, which is worse than none: one write
+	 * would follow a corrected offset and the other would not. */
+	if (ep->swm->gphy_misc)
+		iowrite32(1, ep->sw + ep->swm->gphy_misc);	/* PATCH_PHY_DONE */
 	msleep(500);
 	iowrite32(0x00003000, ep->sw + 0x0);	/* GPHY power down */
 	iowrite32(0x0060a400, ep->sw + 0x4);
@@ -2831,9 +2840,9 @@ static void rtl9602c_uboot_swcore_bringup(struct rtl9602c_eth *ep)
 	iowrite32(0x003fffff, ep->sw + 0x27004);
 	iowrite32(0x00000196, ep->sw + 0x18c);		/* CPU port ability */
 	iowrite32(0x00000fff, ep->sw + 0x1c0);		/* CPU port force mode */
-	iowrite32(0x00012bbd, ep->sw + 0x25000);	/* meter tick-token */
-	iowrite32(0,          ep->sw + 0x13008);	/* VLAN function disable */
-	iowrite32(1, ep->sw + 0x2a000);			/* VLAN keep-format p0-3 */
+	iowrite32(0x00012bbd, ep->sw + SW_METER_TB_CTRL);	/* meter tick-token */
+	iowrite32(0,          ep->sw + SW_VLAN_CTRL);	/* VLAN function disable */
+	iowrite32(1, ep->sw + SW_VLAN_EGRESS_TAG);			/* VLAN keep-format p0-3 */
 	iowrite32(1, ep->sw + 0x2a004);
 	iowrite32(1, ep->sw + 0x2a008);
 	iowrite32(1, ep->sw + 0x2a00c);
@@ -3089,7 +3098,9 @@ static int rtl9602c_eth_open(struct net_device *ndev)
 	 * MAC_CPU_TAG_CTRL = 0x300 (TAG_AWARE bit9 + TRAP_TARGET_INSERT_EN bit8): the
 	 * switch PARSES the cpu-tag on CPU-port ingress so a CPU TX frame is steered by
 	 * the tag (stream-id for the OMCC US OMCI) instead of L2-DA-flooded. Aux regs
-	 * (live-stock): 0x230F0=0x00400034, 0x230F4=0x00f000ea, 0x230F8=0x00400034. */
+	 * (live-stock, and NAMED from the chip's own chipdef 2026-08-29):
+	 * FC_P_LO_TH=0x00400034, FC_P_FCOFF_HI_TH=0x00f000ea,
+	 * FC_P_FCOFF_LO_TH=0x00400034. */
 	if (ep->sw) {
 		/* OFF->ON edge re-latches the SWITCH CPU-port cpu-tag PARSER, mirroring the
 		 * GMAC CPUTAGCR re-latch above. Behavioral note: TAG_AWARE
@@ -3100,9 +3111,9 @@ static int rtl9602c_eth_open(struct net_device *ndev)
 		iowrite32(0, ep->sw + SW_MAC_CPU_TAG_CTRL);
 		wmb();					/* clear must land before the re-arm edge */
 		iowrite32(sw_tagaware, ep->sw + SW_MAC_CPU_TAG_CTRL);
-		iowrite32(0x00400034, ep->sw + 0x230F0);
-		iowrite32(0x00f000ea, ep->sw + 0x230F4);
-		iowrite32(0x00400034, ep->sw + 0x230F8);
+		iowrite32(0x00400034, ep->sw + SW_FC_P_LO_TH);
+		iowrite32(0x00f000ea, ep->sw + SW_FC_P_FCOFF_HI_TH);
+		iowrite32(0x00400034, ep->sw + SW_FC_P_FCOFF_LO_TH);
 	}
 	/* GMAC config regs that a LIVE stock ONU at O5 SETS but my driver left at 0 /
 	 * masked wrong — found by full block diff. The earlier masking of MSR(0x58) down
@@ -3328,16 +3339,22 @@ static netdev_tx_t rtl9602c_eth_xmit(struct sk_buff *skb,
 static void rtl9602c_eth_set_rx_mode(struct net_device *ndev)
 {
 	struct rtl9602c_eth *ep = netdev_priv(ndev);
-	u32 rcr = ep_rd(ep, R_RCR);
 
-	if (ndev->flags & (IFF_PROMISC | IFF_ALLMULTI))
-		rcr |= BIT(0);
-	else
-		rcr &= ~BIT(0);
-	ep_wr(ep, R_RCR, rcr);
+	luna_eth_set_promisc(ep->base,
+				 !!(ndev->flags & (IFF_PROMISC | IFF_ALLMULTI)));
 }
 
+#ifdef CONFIG_GPON_FLOW_OFFLOAD
+/* This family's five-op table for the COMMON TC lifecycle.  Included here, not
+ * at the top, because it needs `struct rtl9602c_eth` complete and the WAN ops
+ * table defined -- and the LAN ops table below needs ITS ndo_setup_tc. */
+#include "rtl9602c_l34_tc.c"
+#endif
+
 static const struct net_device_ops rtl9602c_eth_netdev_ops = {
+#ifdef CONFIG_GPON_FLOW_OFFLOAD
+	.ndo_setup_tc		= rtl9602c_l34_setup_tc,
+#endif
 	.ndo_open		= rtl9602c_eth_open,
 	.ndo_stop		= rtl9602c_eth_stop,
 	.ndo_start_xmit		= rtl9602c_eth_xmit,
@@ -3539,10 +3556,10 @@ static int rtl9602c_diag_show(struct seq_file *m, void *v)
 		   ep_rd(ep, 0x13c4) & 0xffff, ep_rd(ep, 0x13d4) & 0xffff);
 	if (ep->sw) {
 		seq_printf(m, "SW permit(1c088)=%08x flood bc/mc/uc=%08x/%08x/%08x\n",
-			   ioread32(ep->sw + SW_SRC_PORT_PERMIT),
-			   ioread32(ep->sw + SW_LUT_BC_FLOOD),
-			   ioread32(ep->sw + SW_LUT_UNKN_MC_FLOOD),
-			   ioread32(ep->sw + SW_LUT_UNKN_UC_FLOOD));
+			   ioread32(ep->sw + ep->swm->src_permit),
+			   ioread32(ep->sw + ep->swm->bc_flood),
+			   ioread32(ep->sw + ep->swm->unkn_mc_flood),
+			   ioread32(ep->sw + ep->swm->unkn_uc_flood));
 		seq_printf(m, "SW vlan_ctrl(13008)=%08x cputag_ctrl(23030)=%08x\n",
 			   ioread32(ep->sw + SW_VLAN_CTRL),
 			   ioread32(ep->sw + SW_MAC_CPU_TAG_CTRL));
@@ -3556,7 +3573,7 @@ static int rtl9602c_diag_show(struct seq_file *m, void *v)
 		/* LAN ports p0(FE)/p1(GE): if the injected US OMCI floods here, the cpu-tag
 		 * steering failed and the frame went to the L2 switch instead of the US-NIC. */
 		seq_printf(m, "MIB p0(LAN) tx=%08x | p1(LAN) tx=%08x\n",
-			   ioread32(ep->sw + 0x32000), ioread32(ep->sw + 0x32080));
+			   ioread32(ep->sw + SW_STAT_PORT_TX_MIB), ioread32(ep->sw + 0x32080));
 		seq_printf(m, "MIB p2(PON) tx=%08x %08x %08x | rx=%08x %08x %08x\n",
 			   ioread32(ep->sw + 0x32100), ioread32(ep->sw + 0x32104),
 			   ioread32(ep->sw + 0x32108), ioread32(ep->sw + 0x32500),
@@ -3598,7 +3615,8 @@ static int rtl9602c_eth_probe(struct platform_device *pdev)
 		return PTR_ERR(ep->base);
 
 	/* Switch core (best-effort; minimal L2 flood enabled at open). */
-	ep->sw = devm_ioremap(dev, SWCORE_PHYS, SWCORE_SIZE);
+	ep->swm = &rtl9602c_sw_map;
+	ep->sw = devm_ioremap(dev, SWCORE_PHYS, ep->swm->swcore_size);
 	/* network-engine TX-fetch GO register page (phys 0x18001000, a SEPARATE page
 	 * below the GMAC). The stock device sets bit31 of +0x38 then polls it clear on
 	 * EVERY submit to command the self-polling TX DMA to fetch the freshly-published
@@ -3615,11 +3633,36 @@ static int rtl9602c_eth_probe(struct platform_device *pdev)
 	ep->ub_iocmd = ep_rd(ep, R_IO_CMD);
 	ep->ub_iocmd1 = ep_rd(ep, R_IO_CMD1);
 
-	rtl9602c_eth_get_hwaddr(ep, mac);
-	if (is_valid_ether_addr(mac))
+	/* ★ THE BRING-UP DEFAULT IS REFUSED, not merely validated.  This test used
+	 * to be `is_valid_ether_addr()` alone, and the family's bring-up default
+	 * PASSES it -- so this board shipped 00:e0:4c:86:70:01, the same address
+	 * its RTL9603CVD sibling holds, on a segment carrying three ONUs.  MEASURED
+	 * 2026-08-28 from the lab host's ARP table.  The predicate is the family's
+	 * (luna_eth_regs.h): keeping a second copy here is what let the sibling's
+	 * repair miss this driver in the first place. */
+	if (mac_param && luna_mac_from_param(mac_param, mac)) {
+		/* Announced, because a MAC that arrived from OUTSIDE the device
+		 * must be auditable in the log: it is the one rung where a wrong
+		 * declaration cannot be told from a right one by reading the
+		 * board. */
 		eth_hw_addr_set(ndev, mac);
-	else
+		dev_info(dev, "MAC %pM taken from the `mac=` boot parameter\n", mac);
+		goto mac_done;
+	}
+	rtl9602c_eth_get_hwaddr(ep, mac);
+	if (is_valid_ether_addr(mac) && !luna_mac_is_bringup_default(mac)) {
+		eth_hw_addr_set(ndev, mac);
+	} else {
 		eth_hw_addr_random(ndev);
+		dev_warn(dev,
+			 "MAC engine holds %pM: %s. Using a random locally-administered address %pM instead -- this board's real MAC lives in the vendor config partition and is not read yet\n",
+			 mac,
+			 is_valid_ether_addr(mac)
+			 ? "the SILICON BRING-UP DEFAULT, identical on every board of this family, which would collide on a shared segment"
+			 : "not a valid unicast address",
+			 ndev->dev_addr);
+	}
+mac_done:
 
 	/* Bring up the switch L3/L4 NAT engine (gated by the hw_nat param). This
 	 * writes switch-core registers, so it is validated for datapath safety
@@ -3630,6 +3673,33 @@ static int rtl9602c_eth_probe(struct platform_device *pdev)
 		} else {
 			dev_info(dev, "L34 hw-nat engine initialised\n");
 			rtl9602c_l34_proc_init(&ep->l34);	/* bring-up harness */
+#ifdef CONFIG_GPON_FLOW_OFFLOAD
+			/* The COMMON lifecycle owns the cookie map and the
+			 * entry; this driver supplies five ops.  ★ Its install
+			 * REFUSES today -- the NETIF/NEXTHOP tables are not
+			 * provisioned, so a flow would blackhole while reading
+			 * back healthy.  Registering anyway is what proves the
+			 * core's contract is reachable from this family. */
+			ep->fo = gpon_flow_offload_new(&rtl9602c_l34_flow_ops, ep);
+			if (!ep->fo) {
+				dev_warn(dev, "L34: the common TC lifecycle could not be created; software forwarding\n");
+			} else if (devm_add_action_or_reset(dev, rtl9602c_l34_fo_release,
+							   ep)) {
+				/* ★ THE HANDLE IS OWNED BY THE DEVICE, not by a
+				 * .remove this driver does not have.  It is
+				 * module_platform_driver() with NO .remove at
+				 * all -- a pre-existing gap, and not one this
+				 * change is entitled to close by inventing a
+				 * teardown for the whole driver.  What it IS
+				 * responsible for is the allocation it just
+				 * made, so devm owns it: the flows are pulled
+				 * out of the hardware and the handle freed
+				 * whenever the device goes away, including on
+                                 * a failed probe below this point. */
+				dev_warn(dev, "L34: could not bind the TC lifecycle to the device; software forwarding\n");
+				ep->fo = NULL;
+			}
+#endif
 		}
 	}
 
