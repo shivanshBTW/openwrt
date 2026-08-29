@@ -461,6 +461,34 @@ linked kernel contains the staged card-disable format string, every step
 name, the TX lock/unlock guards and the ASPM-disable message. R8 is preserved
 separately and must not be radio-unlocked again.
 
+The controlled R9 up/down test passed every marker through
+`before nic disable flow`, then hung (~50 ms later, truncated `[  127.6`).
+`complete` never appeared. That isolates the stall to
+`rtl_hal_pwrseqcmdparsing(RTL8192F_NIC_DISABLE_FLOW)`. That table begins with
+`ACT_TO_CARDEMU`, which writes `0x05` bit 1 (MAC off by hardware state
+machine) and polls the same bit. A `rtl_read_byte()` that never returns
+cannot be bounded by the 5000-iteration poll cap. R7's LED-off then hang is
+the same point: the MAC/RF pad dropped, then the next BAR access froze the
+CPU. Do not unlock R9 again.
+
+R10 skips `RTL8192F_NIC_DISABLE_FLOW` only on `ovt,op2200h`. LPS enter, RF
+off and MCU reset already completed on R9; CARDDIS/PDN is not required for a
+RAM-boot interface down. The TX gate and ASPM disable remain. Success is
+`skipping NIC_DISABLE_FLOW`, then `before rsv ctrl`, `poweroff adapter done`,
+`complete`, and a returned shell. If it hangs on `before rsv ctrl`, the BAR
+is already dead before that flow.
+
+R10 built on 2026-08-30 as a legacy MIPS/LZMA uImage with load/entry
+`0x80000000`, total size 4,279,768 bytes and payload 4,279,704 bytes.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 7e7431b217d4a53e304f67963429008ad8fe7622e4a9bbae9addfe0ffe77319b
+
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-r9-initramfs-kernel.bin
+SHA256 5212e05234691f0fb5cf9517bf277eb019fcbd2d9af2565c2a9e20af2f6ad82f
+```
+
 ```text
 bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
 SHA256 5212e05234691f0fb5cf9517bf277eb019fcbd2d9af2565c2a9e20af2f6ad82f

@@ -1890,10 +1890,23 @@ static void _rtl92fe_poweroff_adapter(struct ieee80211_hw *hw)
 	/* reset MCU ready status */
 	rtl_write_byte(rtlpriv, REG_MCUFWDL, 0x00);
 
-	/* HW card disable configuration. */
+	/* HW card disable configuration.
+	 * R9: last printed marker was "before nic disable flow", then the
+	 * UART died.  RTL8192F_NIC_DISABLE_FLOW starts with
+	 * ACT_TO_CARDEMU, which writes 0x05 bit 1 (MAC off by HW SM) and
+	 * then polls that bit.  On the RTL9607C fixed-window host a BAR
+	 * read after MAC-off never completes, so the poll timeout cannot
+	 * save us.  Skip that flow on OP2200H; RF is already off and the
+	 * MCU is already reset. */
 	op2200h_card_disable_mark("before nic disable flow");
-	rtl_hal_pwrseqcmdparsing(rtlpriv, PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK,
-				 PWR_INTF_PCI_MSK, RTL8192F_NIC_DISABLE_FLOW);
+	if (of_machine_is_compatible("ovt,op2200h")) {
+		pr_info("rtl8192fe: OP2200H skipping NIC_DISABLE_FLOW (MAC-off poll hangs RTL9607C BAR)\n");
+		mdelay(50);
+	} else {
+		rtl_hal_pwrseqcmdparsing(rtlpriv, PWR_CUT_ALL_MSK,
+					 PWR_FAB_ALL_MSK, PWR_INTF_PCI_MSK,
+					 RTL8192F_NIC_DISABLE_FLOW);
+	}
 
 	/* Reset MCU IO Wrapper */
 	op2200h_card_disable_mark("before rsv ctrl");
