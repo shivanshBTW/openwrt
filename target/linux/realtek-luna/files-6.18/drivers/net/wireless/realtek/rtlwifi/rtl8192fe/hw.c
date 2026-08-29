@@ -31,6 +31,13 @@ static int xtal_cap = -1;
 module_param(xtal_cap, int, 0644);
 MODULE_PARM_DESC(xtal_cap, "RTL8192F crystal load-cap trim 0..0x3f (<0 = use EFUSE/board-cal value)");
 
+/* R6 keeps OP2200H transmission as an explicit, non-persistent operator
+ * decision even after its stock per-channel power deltas are represented.
+ * The default false value makes every RAM boot fail closed. */
+static bool op2200h_allow_tx;
+module_param(op2200h_allow_tx, bool, 0600);
+MODULE_PARM_DESC(op2200h_allow_tx, "Permit OP2200H RTL8192F hardware init/transmit (default: false)");
+
 static void _rtl92fe_set_bcn_ctrl_reg(struct ieee80211_hw *hw,
 				      u8 set_bits, u8 clear_bits)
 {
@@ -1400,6 +1407,16 @@ int rtl92fe_hw_init(struct ieee80211_hw *hw)
 	int err = 0;
 	u8 tmp_u1b, u1byte;
 
+	/* Fail closed on every RAM boot.  R6 represents the stock per-channel
+	 * deltas, but radio initialization is still allowed only after an
+	 * explicit runtime opt-in through the root-only module parameter. */
+	if (of_machine_is_compatible("ovt,op2200h") && !op2200h_allow_tx) {
+		pr_err("rtl8192fe: OP2200H TX LOCKED: set the root-only op2200h_allow_tx parameter explicitly before a controlled radio test\n");
+		return 1;
+	}
+	if (of_machine_is_compatible("ovt,op2200h"))
+		pr_warn("rtl8192fe: OP2200H TX EXPLICITLY UNLOCKED for this RAM boot\n");
+
 	rtl_dbg(rtlpriv, COMP_INIT, DBG_LOUD, " Rtl8192FE hw init\n");
 	rtlpriv->rtlhal.being_init_adapter = true;
 	rtlpriv->intf_ops->disable_aspm(hw);
@@ -1875,9 +1892,12 @@ void rtl92fe_card_disable(struct ieee80211_hw *hw)
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
 	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
+	bool op2200h = of_machine_is_compatible("ovt,op2200h");
 	enum nl80211_iftype opmode;
 
 	rtl_dbg(rtlpriv, COMP_INIT, DBG_LOUD, "RTL8192fe card disable\n");
+	if (op2200h)
+		pr_info("rtl8192fe: OP2200H card disable begin\n");
 
 	RT_SET_PS_LEVEL(ppsc, RT_RF_OFF_LEVL_HALT_NIC);
 
@@ -1899,6 +1919,8 @@ void rtl92fe_card_disable(struct ieee80211_hw *hw)
 	 * (which can settle to identity) on a freshly reset baseband. Only a reboot
 	 * re-ran a real IQK. Clearing here makes a reload recalibrate for real. */
 	rtlpriv->phy.iqk_initialized = false;
+	if (op2200h)
+		pr_info("rtl8192fe: OP2200H card disable complete\n");
 }
 
 void rtl92fe_interrupt_recognized(struct ieee80211_hw *hw,
@@ -2315,6 +2337,9 @@ struct rtl92fe_board_cal {
 	 * wrong board: see the note at rtl92fe_board_cals[]. */
 	const char *compat;
 	const char *board;
+	/* Optional identity fallback.  A zero/invalid address is deliberately
+	 * ignored so a profile can carry shared board calibration without
+	 * embedding one unit's factory identity. */
 	u8 mac[ETH_ALEN];
 	/* per-channel (ch1..ch14) CCK base power, path A / path B */
 	u8 cck_a[CHANNEL_MAX_NUMBER_2G];
@@ -2322,9 +2347,16 @@ struct rtl92fe_board_cal {
 	/* per-channel (ch1..ch14) HT40 1S base power, path A / path B */
 	u8 ht40_1s_a[CHANNEL_MAX_NUMBER_2G];
 	u8 ht40_1s_b[CHANNEL_MAX_NUMBER_2G];
+	/* Stock rtl8192cd format: one byte per channel, path A in the low
+	 * signed nibble and path B in the high signed nibble. */
+	u8 ht40_2s_diff[CHANNEL_MAX_NUMBER_2G];
+	u8 ht20_diff[CHANNEL_MAX_NUMBER_2G];
+	u8 ofdm_diff[CHANNEL_MAX_NUMBER_2G];
+	bool has_channel_diffs;
 	u8 thermalmeter;	/* HW_WLAN0_11N_THER  */
 	u8 crystalcap;		/* HW_WLAN0_11N_XCAP  (xtal load cap) */
-	u8 pa_type;		/* HW_WLAN0_11N_PA_TYPE (0 = internal PA) */
+	u8 rfe_type;		/* RTL8192F RF-front-end/pinmux type */
+	u8 external_pa;		/* IQK PA path selection */
 	u8 reg_domain;		/* HW_WLAN0_REG_DOMAIN */
 };
 
@@ -2342,7 +2374,9 @@ static const struct rtl92fe_board_cal rtl92fe_x111w_cal = {
 		       0x2c, 0x2c, 0x2c, 0x2c, 0x2c, 0x2c, 0x2c },
 	.thermalmeter = 0x36,
 	.crystalcap = 0x47,
-	.pa_type = 0,
+	/* Proven experimentally on this board; do not reuse for another model. */
+	.rfe_type = 7,
+	.external_pa = 1,
 	.reg_domain = 1,
 };
 
@@ -2390,8 +2424,51 @@ static const struct rtl92fe_board_cal rtl92fe_g24w_cal = {
 		       0x2e, 0x2e, 0x2f, 0x2f, 0x2f, 0x2f, 0x2f },
 	.thermalmeter = 0x34,
 	.crystalcap = 0x21,
-	.pa_type = 0,
+	/* Proven experimentally on this board; do not reuse for another model. */
+	.rfe_type = 7,
+	.external_pa = 1,
 	.reg_domain = 0x14,
+};
+
+/*
+ * OVT OP2200H (RTL9607Cv2), stock wlan1 / RTL8192FnB.
+ *
+ * Captured read-only from the running stock driver's /proc/wlan1/mib_rf on
+ * 2026-08-29.  The stock report identifies a 2T2R part with rfe_type 3,
+ * pa_type 0 and trswitch 0.  The decimal proc values `ther: 42` and `xcap: 16`
+ * are stored below as 0x2a and 0x10 respectively.
+ *
+ * Do not add a unit MAC here: this profile is shared by every OP2200H.  The
+ * operational address must later come from a board nvmem cell/DT or another
+ * identity-preserving source.
+ *
+	 * Stock also supplies per-channel packed HT20/OFDM difference arrays.  R6
+	 * preserves them byte-for-byte and decodes their signed path-A/path-B
+	 * nibbles in rtl92fe_board_channel_diff().
+ */
+static const struct rtl92fe_board_cal rtl92fe_op2200h_cal = {
+	.compat = "ovt,op2200h", .board = "OP2200H",
+	/* .mac remains all-zero by design. */
+	.cck_a = { 0x20, 0x20, 0x20, 0x21, 0x21, 0x21, 0x21,
+		   0x21, 0x21, 0x22, 0x22, 0x22, 0x22, 0x22 },
+	.cck_b = { 0x21, 0x21, 0x21, 0x23, 0x23, 0x23, 0x23,
+		   0x23, 0x23, 0x24, 0x24, 0x24, 0x24, 0x24 },
+	.ht40_1s_a = { 0x27, 0x27, 0x27, 0x28, 0x28, 0x28, 0x28,
+		       0x28, 0x28, 0x29, 0x29, 0x29, 0x29, 0x29 },
+	.ht40_1s_b = { 0x28, 0x28, 0x28, 0x29, 0x29, 0x29, 0x29,
+		       0x29, 0x29, 0x2a, 0x2a, 0x2a, 0x2a, 0x2a },
+	.ht40_2s_diff = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	.ht20_diff = { 0x02, 0x02, 0x02, 0x10, 0x10, 0x10, 0x10,
+		       0x10, 0x10, 0x11, 0x11, 0x11, 0x11, 0x11 },
+	.ofdm_diff = { 0x0f, 0x0f, 0x0f, 0x10, 0x10, 0x10, 0x10,
+		       0x10, 0x10, 0x11, 0x11, 0x11, 0x11, 0x11 },
+	.has_channel_diffs = true,
+	.thermalmeter = 0x2a,
+	.crystalcap = 0x10,
+	.rfe_type = 3,
+	.external_pa = 0,
+	.reg_domain = 1,
 };
 
 /*
@@ -2416,7 +2493,14 @@ static const struct rtl92fe_board_cal rtl92fe_g24w_cal = {
 static const struct rtl92fe_board_cal *const rtl92fe_board_cals[] = {
 	&rtl92fe_x111w_cal,
 	&rtl92fe_g24w_cal,
+	&rtl92fe_op2200h_cal,
 };
+
+/* The supported boards contain one RTL8192F.  Track which ieee80211_hw had a
+ * blank efuse replaced by a board profile so a hypothetical valid-efuse device
+ * never consumes the machine profile's per-channel deltas. */
+static const struct rtl92fe_board_cal *rtl92fe_active_board_cal;
+static struct ieee80211_hw *rtl92fe_active_board_cal_hw;
 
 static const struct rtl92fe_board_cal *_rtl92fe_board_cal_for_this_board(void)
 {
@@ -2427,6 +2511,43 @@ static const struct rtl92fe_board_cal *_rtl92fe_board_cal_for_this_board(void)
 		    of_machine_is_compatible(rtl92fe_board_cals[i]->compat))
 			return rtl92fe_board_cals[i];
 	return NULL;
+}
+
+bool rtl92fe_has_board_channel_diffs(struct ieee80211_hw *hw)
+{
+	return hw == rtl92fe_active_board_cal_hw && rtl92fe_active_board_cal &&
+	       rtl92fe_active_board_cal->has_channel_diffs;
+}
+
+s8 rtl92fe_board_channel_diff(struct ieee80211_hw *hw,
+			       enum rtl92fe_board_pwr_diff kind,
+			       enum radio_path rfpath, u8 channel)
+{
+	const struct rtl92fe_board_cal *cal = rtl92fe_active_board_cal;
+	const u8 *table;
+	u8 nibble;
+
+	if (hw != rtl92fe_active_board_cal_hw || !cal ||
+	    !cal->has_channel_diffs || channel < 1 || channel > 14)
+		return 0;
+
+	switch (kind) {
+	case RTL92FE_BOARD_DIFF_OFDM:
+		table = cal->ofdm_diff;
+		break;
+	case RTL92FE_BOARD_DIFF_HT20:
+		table = cal->ht20_diff;
+		break;
+	case RTL92FE_BOARD_DIFF_HT40_2S:
+		table = cal->ht40_2s_diff;
+		break;
+	default:
+		return 0;
+	}
+
+	nibble = table[channel - 1];
+	nibble = (rfpath == RF90_PATH_B) ? (nibble >> 4) : (nibble & 0x0f);
+	return (nibble & BIT(3)) ? (s8)nibble - 0x10 : (s8)nibble;
 }
 
 /* Populate rtlefuse from the board cal table when the efuse is blank, then
@@ -2445,10 +2566,11 @@ static void _rtl92fe_apply_board_cal(struct ieee80211_hw *hw,
 	 * a valid per-chip address stops base.c from assigning a random
 	 * 00:e0:4c MAC when no board MAC is present.
 	 */
-	memcpy(efu->dev_addr, cal->mac, ETH_ALEN);
+	if (is_valid_ether_addr(cal->mac))
+		memcpy(efu->dev_addr, cal->mac, ETH_ALEN);
 
-	/* Per-channel tx-power.  Paths A/B are the only populated RF paths on
-	 * this 1T1R part; fill A and B (and mirror onto any extra MAX_RF_PATH
+	/* Per-channel tx-power.  Paths A/B are the populated RF paths on this
+	 * 2T2R part; fill A and B (and mirror onto any extra MAX_RF_PATH
 	 * slots from path A so nothing is left at 0).
 	 */
 	for (rf = 0; rf < MAX_RF_PATH; rf++) {
@@ -2461,9 +2583,9 @@ static void _rtl92fe_apply_board_cal(struct ieee80211_hw *hw,
 			efu->txpwrlevel_ht40_1s[rf][ch] = ht40[ch];
 		}
 
-		/* All power diffs are zero on this board (DIFF_OFDM /
-		 * DIFF_HT20 / DIFF_HT40_2S == 0): HT20 == HT40, OFDM == CCK
-		 * base, no 2S path.
+		/* The X111W/G24W profiles represented by this original layout have
+		 * zero power diffs.  OP2200H's non-zero per-channel deltas bypass
+		 * these efuse-shaped fields through rtl92fe_board_channel_diff().
 		 */
 		for (ch = 0; ch < MAX_TX_COUNT; ch++) {
 			efu->txpwr_cckdiff[rf][ch] = 0;
@@ -2489,26 +2611,13 @@ static void _rtl92fe_apply_board_cal(struct ieee80211_hw *hw,
 	efu->crystalcap = cal->crystalcap & 0x3f;
 	efu->eeprom_crystalcap = cal->crystalcap & 0x3f;
 
-	/* Front-end / regulatory.  The WiFi efuse is blank, so rfe_type cannot be
-	 * auto-read.  The board WiFi chip is an RTL8192FR (integrated PA/LNA -- no
-	 * external FEM on the PCB), so the PA is physically internal.  Two settings
-	 * are decoupled here, both tuned empirically on this board:
-	 *  - RFE control pins (T/R switch + RX-LNA routing) MUST be programmed: the
-	 *    no-op rfe_type 3 left them at BB-table defaults -> deaf RX (peer heard
-	 *    at -100dBm).  _rtl92fe_config_rfe() (from _rtl92fe_config_trx_mode_ab)
-	 *    writes the rfe_type-7 RFE-pinmux pattern -- the only PCIe 8192F RFE init
-	 *    that enables the T/R switch here; its ext-PA-enable half is inert with
-	 *    no external PA fitted.  RX recovers ~68dB.
-	 *  - external_pa: despite the integrated (internal) PA, external_pa=1 is
-	 *    EMPIRICALLY better -- it selects the ext-PA IQK TX-gain (PAD_TXG 0x30),
-	 *    which drives this PA cleanly (~96% link).  external_pa=0 (internal
-	 *    PAD_TXG 0xe9) REGRESSED to ~40% with assoc timeouts (the DM under-drives
-	 *    the TX), so keep external_pa=1.
-	 */
-	rtl_hal(rtlpriv)->rfe_type = 7;
+	/* Front-end / regulatory values are profile-scoped.  Blank efuse cannot
+	 * provide them, and borrowing another board's empirical RFE/IQK choice can
+	 * mis-drive its antenna switch or PA. */
+	rtl_hal(rtlpriv)->rfe_type = cal->rfe_type;
 	efu->board_type = 0;
 	rtl_hal(rtlpriv)->board_type = 0;
-	efu->external_pa = 1;
+	efu->external_pa = cal->external_pa;
 	efu->eeprom_regulatory = cal->reg_domain & 0x07;
 
 	/* Channel plan: 2.4 GHz world-wide 13 (+ ch14 handled per-channel). */
@@ -2518,12 +2627,15 @@ static void _rtl92fe_apply_board_cal(struct ieee80211_hw *hw,
 	 * loaded so RF / tx-power bring-up uses these values.
 	 */
 	efu->autoload_failflag = false;
+	rtl92fe_active_board_cal = cal;
+	rtl92fe_active_board_cal_hw = hw;
 
-	pr_info("rtl8192fe: applied board WiFi cal (%s): MAC=%pM xtal=0x%02x thermal=0x%02x cck[A1]=0x%02x ht40[A1]=0x%02x reg=%u\n",
+	pr_info("rtl8192fe: applied board WiFi cal (%s): MAC=%pM xtal=0x%02x thermal=0x%02x cck[A1]=0x%02x ht40[A1]=0x%02x rfe=%u ext_pa=%u reg=%u\n",
 		cal->board ? cal->board : "?",
 		efu->dev_addr, efu->crystalcap, efu->eeprom_thermalmeter,
 		efu->txpwrlevel_cck[RF90_PATH_A][0],
 		efu->txpwrlevel_ht40_1s[RF90_PATH_A][0],
+		rtl_hal(rtlpriv)->rfe_type, efu->external_pa,
 		efu->eeprom_regulatory);
 }
 

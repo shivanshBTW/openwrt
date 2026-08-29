@@ -6,6 +6,7 @@
 #include "../ps.h"
 #include "reg.h"
 #include "def.h"
+#include "hw.h"
 #include "phy.h"
 #include "rf.h"
 #include "dm.h"
@@ -1178,8 +1179,9 @@ static u8 _rtl92fe_get_txpower_index(struct ieee80211_hw *hw,
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 	struct rtl_efuse *rtlefuse = rtl_efuse(rtlpriv);
 	u8 index = (channel - 1);
-	u8 tx_power = 0;
+	s16 tx_power = 0;
 	u8 diff = 0;
+	bool board_channel_diffs = rtl92fe_has_board_channel_diffs(hw);
 
 	if (channel < 1 || channel > 14) {
 		index = 0;
@@ -1194,11 +1196,27 @@ static u8 _rtl92fe_get_txpower_index(struct ieee80211_hw *hw,
 
 	/* OFDM-1T */
 	if (DESC_RATE6M <= rate && rate <= DESC_RATE54M &&
-	    !IS_CCK_RATE((s8)rate))
-		tx_power += rtlefuse->txpwr_legacyhtdiff[rfpath][TX_1S];
+	    !IS_CCK_RATE((s8)rate)) {
+		if (board_channel_diffs)
+			tx_power += rtl92fe_board_channel_diff(
+				hw, RTL92FE_BOARD_DIFF_OFDM, rfpath, channel);
+		else
+			tx_power += rtlefuse->txpwr_legacyhtdiff[rfpath][TX_1S];
+	}
 
 	/* BW20-1S, BW20-2S */
-	if (bw == HT_CHANNEL_WIDTH_20) {
+	if (board_channel_diffs) {
+		/* Stock rtl8192cd applies the per-channel HT20 delta to every
+		 * MCS rate in 20 MHz, then applies HT40_2S to MCS8..15 for both
+		 * 20 and 40 MHz.  Each delta is path-specific. */
+		if (bw == HT_CHANNEL_WIDTH_20 &&
+		    DESC_RATEMCS0 <= rate && rate <= DESC_RATEMCS15)
+			tx_power += rtl92fe_board_channel_diff(
+				hw, RTL92FE_BOARD_DIFF_HT20, rfpath, channel);
+		if (DESC_RATEMCS8 <= rate && rate <= DESC_RATEMCS15)
+			tx_power += rtl92fe_board_channel_diff(
+				hw, RTL92FE_BOARD_DIFF_HT40_2S, rfpath, channel);
+	} else if (bw == HT_CHANNEL_WIDTH_20) {
 		if (DESC_RATEMCS0 <= rate && rate <= DESC_RATEMCS15)
 			tx_power += rtlefuse->txpwr_ht20diff[rfpath][TX_1S];
 		if (DESC_RATEMCS8 <= rate && rate <= DESC_RATEMCS15)
@@ -1216,6 +1234,8 @@ static u8 _rtl92fe_get_txpower_index(struct ieee80211_hw *hw,
 
 	tx_power += diff;
 
+	if (tx_power < 0)
+		tx_power = 0;
 	if (tx_power > MAX_POWER_INDEX)
 		tx_power = MAX_POWER_INDEX;
 

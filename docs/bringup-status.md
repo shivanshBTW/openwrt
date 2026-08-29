@@ -257,6 +257,173 @@ RTL8812FE driver is present to request GIC input 56. `phy0` exposes the expected
 2.4 GHz HT20/HT40, two-stream MCS set, but its interface is down with a generic
 Realtek MAC and no OP2200H calibration, so it must not transmit yet.
 
+The subsequent read-only stock `/proc/wlan1/mib_rf` capture identified the
+2.4 GHz radio as RTL8192FnB, 2T2R, with `rfe_type=3`, `pa_type=0`,
+`trswitch=0`, thermal meter 42 (`0x2a`), XCAP 16 (`0x10`) and regulatory
+domain 1. It also confirmed the four 14-channel base-power arrays already seen
+in the stock startup commands. No unit MAC or other identity-bearing value is
+stored in the source profile.
+
+The fifth RAM-test image adds an OP2200H-only board-calibration profile using
+those base-power, thermal, crystal and RF-front-end values. It also refactors
+the previous calibration helper so RFE and external-PA selection belong to each
+board profile instead of being hardcoded globally. Stock's nonzero HT20/OFDM
+delta arrays are packed per channel, whereas the current rtlwifi efuse model
+stores per-rate-count deltas. R5 therefore has an explicit OP2200H TX lock in
+`rtl92fe_hw_init()`: it can prove the correct profile was selected at PCI probe,
+but any attempt to open the interface is refused until the per-channel deltas
+are represented exactly.
+
+The R5 UART boot passed. Both PCIe links again reached L0 on their first
+attempt, both endpoints enumerated, and the driver logged the exact OP2200H
+profile (`xtal=0x10`, `thermal=0x2a`, `cck[A1]=0x20`, `ht40[A1]=0x27`,
+`rfe=3`, `ext_pa=0`, `reg=1`). `wlan0` remained `state DOWN` and cfg80211
+reported 0.00 dBm. The zero MAC in the profile was deliberately ignored; the
+core supplied its temporary generic fallback rather than embedding a unit
+identity. The same capture exposed two independent follow-ups: CPU1 still
+fails to start, and cfg80211 rejected the compiled-in `regulatory.db` because
+the database did not match its maintainer signature. Neither failure prevented
+the locked, down WiFi device from probing, but the regulatory failure must be
+closed before a transmission test.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 89a64c42ee1093b0c0ba53aec037f1da8704c311d9ae39425c868f2789e4516f
+```
+
+The sixth RAM-test image implements the stock packed delta format exactly.
+The GPL rtl8192cd implementation confirms that each channel byte stores path A
+in its low signed nibble and path B in its high signed nibble, and applies the
+OFDM, HT20 and HT40-2S deltas independently. For example, nibble `f` is -1,
+not +15. R6 preserves the three stock arrays byte-for-byte and decodes them in
+the tx-power-index path. Transmission still fails closed after every boot:
+the root-only `op2200h_allow_tx` module parameter must be explicitly set before
+the interface-open hardware initialization is permitted, and that opt-in is
+lost on reboot.
+
+Source reference: [Realtek GPL `PHY_RF6052SetOFDMTxPower()`](https://github.com/cgoder/openwrt_rtk/blob/master/rtk_openwrt_sdk/target/linux/rtkmips/files/drivers/net/wireless/rtl8192cd/8192cd_hw.c).
+
+The first R6 build (`b206d66893dd8da48d527e70ab5a38cb2c4a1074cad6be18f280075adfef9dde`)
+was not sent to the device: a post-build audit found that its compiled-in
+`regulatory.db` was an older 6,292-byte file paired with the current signature.
+The database was replaced from the official `wireless-regdb-2026.03.18`
+kernel.org archive after its archive hash matched the hash pinned by OpenWrt.
+The exact database and signature extracted back out of the rebuilt `vmlinux`
+have SHA256 `3d437be973206ca41b7f4e8bb6c3da66f9ef17a760763d974fce7812944f36f3`
+and `138cd89205b9612ea3df9eacf2672e5586a08aea986c677d22c5d71ea35774de`;
+OpenSSL CMS verification succeeds on that embedded pair. The TX lock remains
+enabled in this corrected image.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 e37b145f45a7e63767a68cb797ab48df2efab322b67ecd775f9ea15283310e18
+```
+
+The corrected R6 UART boot passed. U-Boot received exactly 4,278,794 bytes,
+validated the uImage CRC, and booted the expected 4,278,730-byte payload. Both
+PCIe links reached L0/Gen1 on their first attempt, the endpoints remained
+`10ec:f812` and `10ec:818c`, and RTL8192FE again selected the exact OP2200H
+profile and firmware without an Oops or panic. Crucially, cfg80211 loaded its
+compiled-in certificate and no longer reported a malformed or invalidly signed
+regulatory database. `iw reg get` now returns a populated database. The
+per-phy `country 99` is rtlwifi's intentional alpha2 for its custom world
+domain, not another database failure; the real operating-country hint must
+still be set before transmission. `wlan0` remained managed, DOWN and 0.00 dBm
+with a new temporary Realtek fallback MAC. CPU1 still failed to start, unchanged
+from the earlier images. Because this capture never attempted to open wlan0,
+the next no-transmit gate is to prove that an interface-open request is refused
+while `op2200h_allow_tx` remains false.
+
+That fail-closed gate passed. Sysfs reported `op2200h_allow_tx=N`; an
+`ip link set dev wlan0 up` request produced the driver's `OP2200H TX LOCKED`
+message, and the final link state contained no `UP` flag and remained
+`state DOWN`. The shell later printed `up_rc=0`, but the UART input around the
+request was interleaved and that value is not the result criterion: the driver
+message plus final kernel link state prove that hardware initialization was
+refused. No explicit unlock has yet been performed.
+
+The pre-unlock runtime preparation also passed. The signed database accepted
+the `IN` user hint and exposed India's rules globally while rtlwifi retained
+its expected custom `99` per-phy ceiling. The 2.4 GHz endpoint was assigned
+this unit's stock `wlan1` address (`08:63:32:61:11:ae`) at runtime; the address
+is deliberately not compiled into the image. No hostapd or wpa_supplicant
+process was present, and wlan0 remained down. The next experiment may therefore
+open the managed interface briefly to exercise hardware/firmware initialization,
+but must not request a scan, association or AP mode.
+
+The first controlled open exposed an IRQ-domain bug and was stopped. With the
+runtime lock explicitly set to `Y`, RTL8192FE completed RF/PHY initialization:
+the readback showed 2T2R, RFE type 3, XCAP `0x10`, both RF paths on channel 7,
+and populated IQK results. As soon as the endpoint asserted PCIe1 INTx, however,
+Linux reported that IRQ 57's flow handler was `handle_bad_irq` even though the
+`_rtl_pci_interrupt` action was attached, then entered a continuous
+`unexpected IRQ #57` storm. No scan, association, AP or data-frame test was
+reached.
+
+The cause is in the PCI host's arch hook, not the WiFi handler. RTL9607C uses
+the MIPS GIC's three-cell specifier `<GIC_SHARED input flags>`; shared input N
+maps to the GIC domain hwirq `GIC_NUM_LOCAL_INTRS + N`. The hook instead passed
+the table's raw input 57 to `irq_create_mapping()`, bypassing the GIC xlate
+step. The next image uses `irq_create_of_mapping()` with the controller's
+declared `#interrupt-cells`: the older Luna one-cell INTCs retain their native
+mapping, while RTL9607C inputs 56/57 take the GIC shared/level-high path. The
+radio must remain locked until a new UART boot proves the resulting descriptor
+uses the GIC level handler before any interface-open attempt.
+
+R7 contains that IRQ-domain correction and retains the default-off OP2200H TX
+lock. The linked `vmlinux` contains `irq_create_of_mapping()`, both new INTx
+mapping diagnostics, and the locked/unlocked guard strings. The regulatory
+database/signature extracted from this rebuilt kernel still match the verified
+R6 pair and pass OpenSSL CMS verification. It is a legacy MIPS/LZMA uImage with
+load/entry `0x80000000`, total size 4,279,879 bytes and payload 4,279,815 bytes.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 f5e6e8854f443c7dfff38954d44ba78db3c374fa363bc00b24c77d608366fd45
+```
+
+The locked R7 UART boot confirms the corrected mapping before radio start.
+PCIe1 shared input 57 now maps to Linux IRQ 15, whose `/proc/interrupts` entry
+is `MIPS GIC 64 rtl_pci`. Hardware IRQ 64 is correct: this kernel's MIPS GIC
+has seven local interrupt slots, so shared input 57 is domain hwirq `7 + 57`.
+The descriptor is therefore owned by the GIC level controller instead of
+`handle_bad_irq`; its action is the rtlwifi PCI handler and its count remains
+zero while the locked interface is down. Linux IRQ 15 is a dynamically
+allocated virtual number and need not match stock's display number 73.
+
+The first controlled R7 interface-open test then passed the point that stopped
+R6. With the India regulatory domain, the unit's factory MAC and the RAM-only
+TX gate set explicitly, `ip link set dev wlan0 up` returned normally. The 2.4
+GHz LED illuminated, RF/PHY initialization reported 2T2R, RFE type 3, XCAP
+`0x10`, both RF paths on channel 7 and populated IQK results; there was no IRQ
+storm. No scan, association, AP or data-frame test was attempted.
+
+`ip link set dev wlan0 down` turned the 2.4 GHz LED off but did not return to
+the shell. That places the stall late in shutdown, after the RTL8192F power-off
+sequence. The remaining rtlwifi stop path tries to restore PCIe ASPM after
+powering the endpoint down. RTL9607C provides fixed configuration-space MMIO
+windows and does not yet have a proven safe abort path for a transaction to a
+powered-down endpoint, making that access the leading cause. R8 disables ASPM
+only for the `ovt,op2200h` machine and adds begin/complete markers around the
+card-disable sequence. R7 must not be unlocked again; repeat the controlled
+open/close test only with R8 after its locked boot is verified.
+
+R8 builds successfully as a legacy MIPS/LZMA uImage with load/entry
+`0x80000000`, total size 4,278,946 bytes and payload 4,278,882 bytes. Its linked
+kernel contains the OP2200H ASPM-disable and both card-disable diagnostics, the
+corrected INTx mapping diagnostic and the default-off TX guard. The embedded
+regulatory database/signature retain the previously verified hashes and pass
+OpenSSL CMS verification. The canonical test filename now refers to R8; R7 is
+preserved separately for diagnosis and must not be radio-unlocked again.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 d46edd37d2a3701f2c721a7f20fd8c7a376e2d1d88a63c5519acb3f786815672
+
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-r7-initramfs-kernel.bin
+SHA256 f5e6e8854f443c7dfff38954d44ba78db3c374fa363bc00b24c77d608366fd45
+```
+
 After a UART-observed RAM boot, collect these before trying to load a WiFi
 driver:
 

@@ -18,6 +18,7 @@
 
 #include <linux/vmalloc.h>
 #include <linux/module.h>
+#include <linux/of.h>
 
 static void rtl92fe_init_aspm_vars(struct ieee80211_hw *hw)
 {
@@ -57,7 +58,19 @@ static void rtl92fe_init_aspm_vars(struct ieee80211_hw *hw)
 	 * 1 - Support ASPM,
 	 * 2 - According to chipset.
 	 */
-	rtlpci->const_support_pciaspm = rtlpriv->cfg->mod_params->aspm_support;
+	/* RTL9607C exposes PCI configuration space through fixed MMIO windows.
+	 * On OP2200H, reprogramming endpoint/bridge ASPM after the RTL8192F has
+	 * been powered off can leave the CPU waiting forever for a config-space
+	 * transaction.  The stock board setup does not give us evidence that
+	 * this host path is safe, so keep ASPM disabled on this board only.
+	 */
+	if (of_machine_is_compatible("ovt,op2200h")) {
+		rtlpci->const_support_pciaspm = 0;
+		pr_info("rtl8192fe: OP2200H PCIe ASPM disabled for RTL9607C fixed-window host\n");
+	} else {
+		rtlpci->const_support_pciaspm =
+			rtlpriv->cfg->mod_params->aspm_support;
+	}
 }
 
 static int rtl92fe_init_sw_vars(struct ieee80211_hw *hw)

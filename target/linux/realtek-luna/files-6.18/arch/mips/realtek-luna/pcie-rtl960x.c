@@ -54,6 +54,7 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/irq.h>
 #include <linux/irqdomain.h>
 #include <linux/kernel.h>
 #include <linux/of.h>
@@ -445,11 +446,18 @@ int pcibios_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 	const struct luna_pcie_chip *chip;
 
 	/* The endpoint's INTx is aggregated by the SoC INTC onto a single input
-	 * line; map that hwirq through the INTC's (linear) irq_domain to obtain
-	 * the Linux virq the PCI core hands to the endpoint driver. Returning the
-	 * raw hwirq would yield an unmapped virq (no_irq_chip) so request_irq()
-	 * fails with -ENOSYS. The INTC drives handle_level_irq, so the line is
-	 * already level-triggered. */
+	 * line. Translate the controller's native DT interrupt specifier instead
+	 * of passing the table input directly to irq_create_mapping(). That raw
+	 * shortcut happens to work for the older one-cell linear Luna INTCs, but
+	 * is wrong for the RTL9607C's three-cell MIPS GIC: GIC shared input N is
+	 * domain hwirq GIC_NUM_LOCAL_INTRS + N. Bypassing gic_irq_domain_xlate()
+	 * mapped input 57 onto a descriptor that retained handle_bad_irq; the
+	 * RTL8192F asserted the real shared input 57 at hardware start and trapped
+	 * the CPU in an unacknowledged `unexpected IRQ #57` storm.
+	 *
+	 * irq_create_of_mapping() invokes each controller's xlate/alloc path, so
+	 * it preserves the old one-cell mapping and correctly creates a shared,
+	 * level-high GIC mapping for the RTL9607C. */
 	if (!host || !host->chip)
 		return 0;
 	chip = host->chip;
@@ -458,13 +466,31 @@ int pcibios_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 
 		np = of_find_compatible_node(NULL, NULL, chip->intc_compat);
 		if (np) {
-			struct irq_domain *domain = irq_find_host(np);
+			struct of_phandle_args oirq = { .np = np };
+			u32 cells;
 
+			if (!of_property_read_u32(np, "#interrupt-cells", &cells)) {
+				if (cells == 1) {
+					oirq.args_count = 1;
+					oirq.args[0] = chip->hwirq;
+				} else if (cells == 3) {
+					/* <GIC_SHARED input IRQ_TYPE_LEVEL_HIGH> */
+					oirq.args_count = 3;
+					oirq.args[0] = 0;
+					oirq.args[1] = chip->hwirq;
+					oirq.args[2] = IRQ_TYPE_LEVEL_HIGH;
+				}
+			}
+			if (oirq.args_count)
+				host->virq = irq_create_of_mapping(&oirq);
 			of_node_put(np);
-			if (domain)
-				host->virq = irq_create_mapping(domain,
-							      chip->hwirq);
 		}
+		if (host->virq)
+			pr_info("realtek-pcie: %s INTx input %u mapped to Linux IRQ %d\n",
+				chip->name, chip->hwirq, host->virq);
+		else
+			pr_err("realtek-pcie: failed to map %s INTx input %u\n",
+			       chip->name, chip->hwirq);
 	}
 	return host->virq;
 }

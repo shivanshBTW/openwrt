@@ -4,6 +4,12 @@
 #ifndef __RTL92F_HW_H__
 #define __RTL92F_HW_H__
 
+enum rtl92fe_board_pwr_diff {
+	RTL92FE_BOARD_DIFF_OFDM,
+	RTL92FE_BOARD_DIFF_HT20,
+	RTL92FE_BOARD_DIFF_HT40_2S,
+};
+
 void rtl92fe_get_hw_reg(struct ieee80211_hw *hw, u8 variable, u8 *val);
 void rtl92fe_read_eeprom_info(struct ieee80211_hw *hw);
 void rtl92fe_interrupt_recognized(struct ieee80211_hw *hw,
@@ -38,4 +44,8 @@ void rtl92fe_resume(struct ieee80211_hw *hw);
 void rtl92fe_allow_all_destaddr(struct ieee80211_hw *hw, bool allow_all_da,
 				bool write_into_reg);
 void rtl92fe_fw_clk_off_timer_callback(unsigned long data);
+bool rtl92fe_has_board_channel_diffs(struct ieee80211_hw *hw);
+s8 rtl92fe_board_channel_diff(struct ieee80211_hw *hw,
+			       enum rtl92fe_board_pwr_diff kind,
+			       enum radio_path rfpath, u8 channel);
 #endif
