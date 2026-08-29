@@ -511,6 +511,13 @@ one idle channel and an immediate empty dump do not prove RX. Next is the
 IRQ count from that attempt, then a wider passive scan if the console is
 still healthy.
 
+After that scan, `grep rtl /proc/interrupts` was still `15: 0 MIPS GIC 64
+rtl_pci` and the TX gate was `N`. The `rtl_pci` handler has never run on this
+R10 boot, including three RF inits. R6 proved the endpoint can assert INTx;
+empty scan plus a zero count is a delivery/RX-enable question, not “no APs on
+channel 7”. A wider scan is not the next step until IRQ 15 increments while
+`wlan0` is up.
+
 ```text
 bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
 SHA256 5212e05234691f0fb5cf9517bf277eb019fcbd2d9af2565c2a9e20af2f6ad82f
