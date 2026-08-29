@@ -495,9 +495,14 @@ The controlled R10 up/down test passed on 2026-08-30. Every marker through
 the 2.4 GHz LED turned off. Software LED-off was still skipped
 (`unload=0 rfoff=0`); the LED going off is the RF/LPS side-effect, matching
 the R7 observation. This is the first controlled hardware shutdown that did
-not hang. It is still not a scan, association, AP or data-path pass. The
-next check on this same RAM boot is whether a second `wlan0 up`/`down` still
-returns after the skipped CARDDIS, then relock.
+not hang. It is still not a scan, association, AP or data-path pass.
+
+The second cycle on the same RAM boot also passed. `wlan0 up` again reported
+2T2R, RFE 3, XCAP `0x10`, channel 7 and populated IQK; `wlan0 down` printed
+every marker through `complete` and returned; `op2200h_allow_tx` was then set
+back to `N`. IRQ 15 stayed `MIPS GIC 64 rtl_pci` at count 0 (idle, no scan).
+Controlled open/close is repeatable without `NIC_DISABLE_FLOW`. Still no
+scan, association, AP or data traffic.
 
 ```text
 bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
