@@ -1783,6 +1783,12 @@ static int _rtl92fe_set_media_status(struct ieee80211_hw *hw,
 	} else if (mode == MSR_ADHOC || mode == MSR_AP) {
 		_rtl92fe_resume_tx_beacon(hw);
 		_rtl92fe_disable_bcn_sub_func(hw);
+		/* R16 cleared EN_BCN_FUNCTION after PHY init so STA/scan did
+		 * not tick BCNDMAINT0.  AP beacons need it back. */
+		if (of_machine_is_compatible("ovt,op2200h")) {
+			_rtl92fe_set_bcn_ctrl_reg(hw, EN_BCN_FUNCTION, 0);
+			pr_info("rtl8192fe: OP2200H EN_BCN_FUNCTION restored for AP/IBSS\n");
+		}
 	} else {
 		rtl_dbg(rtlpriv, COMP_ERR, DBG_WARNING,
 			"Set HW_VAR_MEDIA_STATUS: No such media status(%x).\n",
