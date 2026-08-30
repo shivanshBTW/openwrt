@@ -607,8 +607,13 @@ SHA256 474f57f2396e7fda064e6962f057033214793ca092a2c485e2813c3720c26719
 
 R16 `wlan0 up` returned with ISR still 0 after HIMR (BCNDMAINT0 gone). No storm
 line. IRQ 15 / GIC 57 counted 156 then 333 three seconds later (~60/s idle).
-Shutdown completed. The idle rate may be ROK (receiver) or PSTIMEOUT; a single
-passive scan on this RAM boot distinguishes them. Relocked after down.
+Shutdown completed. Relocked, then a second up on the same RAM boot.
+
+Second up: ISR=`0x00100000` after HIMR (BCNDMAINT0 again on the warm path).
+`iw dev wlan0 scan freq 2442 passive` returned one decoded BSS (HT, RSN) from an
+adjacent primary channel; IRQ 15 went 487 → 659; shutdown completed; TX gate
+relocked. That is the first RTL8192FE receiver pass. Reported signal was
+implausibly positive (RSSI scale still wrong). Do not start AP or associate yet.
 
 R13 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,341
 bytes and payload 4,279,277 bytes.
