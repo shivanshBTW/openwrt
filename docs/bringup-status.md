@@ -615,6 +615,13 @@ adjacent primary channel; IRQ 15 went 487 → 659; shutdown completed; TX gate
 relocked. That is the first RTL8192FE receiver pass. Reported signal was
 implausibly positive (RSSI scale still wrong). Do not start AP or associate yet.
 
+A later full-band `iw dev wlan0 scan passive` on the same RAM boot decoded
+multiple BSS on channels 1, 8 and 11. `iw` then died with `Illegal instruction`
+while printing an HE IE (userspace, not a kernel Oops): `wlan0 down` still
+ran every card-disable marker and the TX gate was relocked. Every BSS still
+reported `+40 dBm` (`recvsignalpower + 10` with PHY status stuck around +30).
+Do not start AP or associate.
+
 R13 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,341
 bytes and payload 4,279,277 bytes.
 
