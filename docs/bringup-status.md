@@ -622,6 +622,19 @@ ran every card-disable marker and the TX gate was relocked. Every BSS still
 reported `+40 dBm` (`recvsignalpower + 10` with PHY status stuck around +30).
 Do not start AP or associate.
 
+R17 parses Jaguar2 2nd-type PHY status (PWDB at byte 1, dBm = pwdb − 110)
+instead of the jaguar1 CCK LNA/VGA table that produced a constant +40 dBm.
+Do not start AP or associate until a passive scan shows negative, varying
+signal values.
+
+R17 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,914
+bytes and payload 4,279,850 bytes.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 d63e1c56abc503aa202af94cb6a77ccb91e6ae2c785ae165aee239e7e8a9b764
+```
+
 R13 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,341
 bytes and payload 4,279,277 bytes.
 

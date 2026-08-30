@@ -12,6 +12,7 @@
 #include "led.h"
 #include "dm.h"
 #include "fw.h"
+#include <linux/of.h>
 
 static u8 _rtl92fe_map_hwqueue_to_fwqueue(struct sk_buff *skb, u8 hw_queue)
 {
@@ -34,12 +35,14 @@ static void _rtl92fe_query_rxphystatus(struct ieee80211_hw *hw,
 {
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 	struct phy_status_rpt *p_phystrpt = (struct phy_status_rpt *)p_drvinfo;
+	__le32 *phy = (__le32 *)p_drvinfo;
 	s8 rx_pwr_all, rx_pwr[4];
 	u8 rf_rx_num = 0, evm, pwdb_all;
 	u8 i, max_spatial_stream;
 	u32 rssi, total_rssi = 0;
 	bool is_cck = pstatus->is_cck;
 	u8 lan_idx, vga_idx;
+	u8 page;
 
 	/* Record it for next packet processing */
 	pstatus->packet_matchbssid = bpacket_match_bssid;
@@ -47,6 +50,40 @@ static void _rtl92fe_query_rxphystatus(struct ieee80211_hw *hw,
 	pstatus->packet_beacon = packet_beacon;
 	pstatus->rx_mimo_signalquality[0] = -1;
 	pstatus->rx_mimo_signalquality[1] = -1;
+
+	/* RTL8192F is a Jaguar2 2nd-type PHY-status IC (same family as
+	 * 8821C).  Page 0 = CCK, page 1/2 = OFDM/HT.  The jaguar1
+	 * path_agc/cck_agc overlay left CCK AGC at 0, so every beacon
+	 * became lan=0 vga=0 -> recvsignalpower +16+10 = +40 dBm. */
+	page = le32_get_bits(phy[0], GENMASK(3, 0));
+	if (page <= 2) {
+		static unsigned int rssi_logs;
+		u8 pwdb, pwdb_b;
+
+		pwdb = le32_get_bits(phy[0], GENMASK(15, 8));
+		pwdb_b = le32_get_bits(phy[0], GENMASK(23, 16));
+		rx_pwr_all = (s8)pwdb - 110;
+		if (rx_pwr_all > 10)
+			rx_pwr_all = 10;
+		if (rx_pwr_all < -100)
+			rx_pwr_all = -100;
+		pstatus->rx_pwr[0] = rx_pwr_all;
+		pstatus->rx_pwr[1] = (page == 0) ? 0 : ((s8)pwdb_b - 110);
+		pwdb_all = rtl_query_rxpwrpercentage(rx_pwr_all);
+		pstatus->rx_pwdb_all = pwdb_all;
+		pstatus->bt_rx_rssi_percentage = pwdb_all;
+		pstatus->rxpower = rx_pwr_all;
+		pstatus->recvsignalpower = rx_pwr_all;
+		pstatus->signalstrength =
+			(u8)rtl_signal_scale_mapping(hw, pwdb_all);
+		if (of_machine_is_compatible("ovt,op2200h") && rssi_logs < 8) {
+			rssi_logs++;
+			pr_info("rtl8192fe: RSSI page=%u rate=0x%02x cck=%u dw0=0x%08x pwdb=%u dBm=%d\n",
+				page, pstatus->rate, is_cck,
+				le32_to_cpu(phy[0]), pwdb, rx_pwr_all);
+		}
+		return;
+	}
 
 	if (is_cck) {
 		u8 cck_highpwr;
@@ -530,7 +567,7 @@ bool rtl92fe_rx_query_desc(struct ieee80211_hw *hw,
 		_rtl92fe_translate_rx_signal_stuff(hw, skb, status, pdesc8,
 						   p_drvinfo);
 	}
-	rx_status->signal = status->recvsignalpower + 10;
+	rx_status->signal = status->recvsignalpower;
 	if (status->packet_report_type == TX_REPORT2) {
 		status->macid_valid_entry[0] =
 			get_rx_rpt2_desc_macid_valid_1(pdesc);
