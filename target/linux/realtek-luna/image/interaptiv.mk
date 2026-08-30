@@ -40,9 +40,9 @@ define Device/ovt_op2200h_pcie_test
   DEVICE_DTS := rtl9607c_ovt_op2200h_pcie_test
   DEVICE_DTS_DIR := $(DTS_DIR)/realtek-luna
   SOC := rtl9607c
-  # hostapd-mini is started by hand after TX unlock. Do not add wifi-scripts:
-  # that would let netifd bring the AP up at boot on one CPU.
-  DEVICE_PACKAGES := -mtd -uboot-envtools hostapd-mini hostapd-common
+  # hostapd-mini and dnsmasq are started by hand after TX unlock. Do not add
+  # wifi-scripts: that would let netifd bring the AP up at boot on one CPU.
+  DEVICE_PACKAGES := -mtd -uboot-envtools hostapd-mini hostapd-common dnsmasq
 endef
 TARGET_DEVICES += ovt_op2200h_pcie_test
 
