@@ -3,8 +3,11 @@
  * OVT OP2200H dual-PCIe test image.
  *
  * This is deliberately separate from the normal milestone-1 DTS. It still
- * has no NAND node and its image profile still emits initramfs only. Its sole
- * hardware difference is enabling the recovered dual-controller PCIe path.
+ * has no NAND node and its image profile still emits initramfs only. Hardware
+ * differences from milestone-1: recovered dual-controller PCIe, and the CPU
+ * GMAC + on-chip switch enabled for the two copper LAN jacks only (switch
+ * ports 0 and 1). GPON/PON is not described here. The driver leaves eth0
+ * down until opened by hand; do not bake a MAC.
  */
 
 /dts-v1/;
@@ -15,4 +18,8 @@
 / {
 	model = "OVT OP2200H (dual-PCIe test)";
 	realtek,enable-pcie;
+};
+
+&nic {
+	status = "okay";
 };

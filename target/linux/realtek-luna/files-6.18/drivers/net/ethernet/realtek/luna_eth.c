@@ -713,6 +713,21 @@ static void gphy_write(struct luna_eth *ep, unsigned int phyad,
 			phyad, reg, val);
 }
 
+static bool luna_is_op2200h(void)
+{
+	return of_machine_is_compatible("ovt,op2200h");
+}
+
+/* OP2200H has two copper jacks (LAN1 = switch port 0, LAN2 = port 1). The
+ * RTL9607C table still lists five PHYs because that is the die; only this
+ * board's jacks are wired. */
+static unsigned int eth_copper_ports(const struct luna_eth *ep)
+{
+	if (luna_is_op2200h())
+		return 2;
+	return ep->c->n_copper;
+}
+
 /* Power up + (re)start auto-negotiation on the integrated copper PHYs so a copper
  * LAN jack actually trains. Each PHY is addressed by its switch port number. */
 /* ★★ ONE BOOT INSTEAD OF THREE.  The open M2 question is whether this chip's FE
@@ -745,7 +760,7 @@ static void eth_phy_survey(struct luna_eth *ep)
 			 "phy survey: CFG_PHY_INI(%#05x) = %08x  (U-Boot loads its per-port field from the efuse; we do NOT write it -- the polarity is unresolved)\n",
 			 ep->c->cfg_phy_ini, sw_rd(ep, ep->c->cfg_phy_ini));
 
-	for (p = 0; p < ep->c->n_copper; p++) {
+	for (p = 0; p < eth_copper_ports(ep); p++) {
 		u16 g_bmcr = gphy_read_ocp(ep, p, GPHY_MII_PAGE | (0 << 1));
 		u16 g_bmsr = gphy_read_ocp(ep, p, GPHY_MII_PAGE | (1 << 1));
 		u16 f_bmcr = gphy_read_ocp(ep, p, 0 << 1);
@@ -943,7 +958,7 @@ static void eth_copper_phy_up(struct luna_eth *ep)
 		sw_wr(ep, ep->c->fephy_poll,
 		      sw_rd(ep, ep->c->fephy_poll) & ~FEPHY_STOP_POLL);
 
-	for (p = 0; p < ep->c->n_copper; p++) {
+	for (p = 0; p < eth_copper_ports(ep); p++) {
 		u16 bmcr = gphy_read(ep, p, 0);
 
 		bmcr &= ~MII_PDOWN;			/* leave power-down	*/
@@ -993,9 +1008,9 @@ static u32 eth_mib_rx_pkts(struct luna_eth *ep, unsigned int p)
  * directly-readable PHY/SerDes (5 PON, 8 RGMII, 9 CPU, 10, 11). */
 static int eth_port_real_link(struct luna_eth *ep, unsigned int p)
 {
-	if (p >= ep->c->n_copper && p != 6 && p != 7)
+	if (p >= eth_copper_ports(ep) && p != 6 && p != 7)
 		return -1;
-	if (p < ep->c->n_copper)
+	if (p < eth_copper_ports(ep))
 		return !!(gphy_read(ep, p, 1) & MII_LSTATUS);	/* BMSR */
 	if (!ep->c->sds_fib_status)		/* no SerDes on this chip */
 		return -1;
@@ -1168,7 +1183,10 @@ static void eth_switch_init(struct luna_eth *ep)
 	/* The external 2.5G PHY hangs off the SerDes uplink, so it exists only on
 	 * a chip that HAS one. Asking for it elsewhere would drive a GPIO chosen
 	 * for a different board. */
-	if (rtl8221b_phy && ep->c->sds_fib_status)
+	/* OP2200H has no RTL8221B 2.5G PHY; the 9607C table still has
+	 * sds_fib_status because the die does. Driving that GPIO here would
+	 * toggle a line chosen for a different board. */
+	if (rtl8221b_phy && ep->c->sds_fib_status && !luna_is_op2200h())
 		eth_rtl8221b_reset_release(ep);
 
 	/* 4. open the L2 forwarding plane. */
@@ -1189,11 +1207,18 @@ static void eth_switch_init(struct luna_eth *ep)
 	 * `pon_port` is only meaningful on a chip that declares one; the mask is
 	 * left untouched where force_pon_ablty is 0, so the RTL9607C engineering
 	 * board sees the identical write it saw before.
+	 *
+	 * OP2200H is the exception: force_pon_ablty is 0 on 9607C, but this
+	 * board still has a fibre port 5. Flooding LAN broadcasts onto it
+	 * would send ARP/DHCP toward the OLT. Restrict flood and STP to the
+	 * two copper jacks plus the CPU port.
 	 */
 	{
 		u32 flood = ep->c->sw_map->port_mask;
 
-		if (ep->c->force_pon_ablty)
+		if (luna_is_op2200h())
+			flood = BIT(0) | BIT(1) | BIT(ep->c->sw_map->cpu_port);
+		else if (ep->c->force_pon_ablty)
 			flood &= ~BIT(ep->c->sw_map->pon_port);
 		sw_or(ep, ep->c->sw_map->bc_flood, flood);
 		sw_or(ep, ep->c->sw_map->unkn_mc_flood, flood);
@@ -1236,9 +1261,13 @@ static void eth_switch_init(struct luna_eth *ep)
 	 *     it looked like only the CPU->all direction worked). */
 	for (p = 0; p <= ep->c->last_port; p++) {
 		u32 v = sw_rd(ep, SW_MSTI_CTRL(ep, p));
+		u32 st = STP_FORWARDING;
 
+		if (luna_is_op2200h() &&
+		    p != 0 && p != 1 && p != ep->c->sw_map->cpu_port)
+			st = 0; /* disabled: no jack / PON / SerDes / PBO */
 		sw_wr(ep, SW_MSTI_CTRL(ep, p),
-		      (v & ~STP_STATE_MASK) | STP_FORWARDING);
+		      (v & ~STP_STATE_MASK) | st);
 	}
 
 	/* 4c. (optional) drop the CPU port from its own egress flood so it stops
@@ -1358,6 +1387,9 @@ static void eth_switch_init(struct luna_eth *ep)
 		 ep->c->name, ep->c->sw_map->cpu_port, ep->c->last_port,
 		 sw_rd(ep, ep->c->sw_map->src_permit),
 		 sw_rd(ep, SW_P_ABLTY(ep, ep->c->sw_map->cpu_port)));
+	if (luna_is_op2200h())
+		dev_info(ep->dev,
+			 "OP2200H LAN-only copper 0-1, PON not flooded, no RTL8221B\n");
 	/* Baseline real-link snapshot; the periodic diag (armed at open) then shows
 	 * which port's genuine link comes up + rxpkts climb under host traffic. */
 	eth_diag_dump(ep);
@@ -1886,6 +1918,9 @@ static int luna_eth_probe(struct platform_device *pdev)
 	dev_info(dev, "%s NIC at %pR, MAC %pM, irq %d\n", ep->c->name,
 		 platform_get_resource(pdev, IORESOURCE_MEM, 0),
 		 ndev->dev_addr, ep->irq);
+	if (luna_is_op2200h())
+		dev_info(dev,
+			 "OP2200H LAN-only copper 0-1, PON not flooded, no RTL8221B\n");
 	return 0;
 }
 
