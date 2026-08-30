@@ -605,6 +605,11 @@ bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie
 SHA256 474f57f2396e7fda064e6962f057033214793ca092a2c485e2813c3720c26719
 ```
 
+R16 `wlan0 up` returned with ISR still 0 after HIMR (BCNDMAINT0 gone). No storm
+line. IRQ 15 / GIC 57 counted 156 then 333 three seconds later (~60/s idle).
+Shutdown completed. The idle rate may be ROK (receiver) or PSTIMEOUT; a single
+passive scan on this RAM boot distinguishes them. Relocked after down.
+
 R13 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,341
 bytes and payload 4,279,277 bytes.
 
