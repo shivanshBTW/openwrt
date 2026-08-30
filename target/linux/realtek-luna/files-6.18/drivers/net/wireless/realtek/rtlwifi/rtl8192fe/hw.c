@@ -16,6 +16,7 @@
 #include "led.h"
 #include <linux/delay.h>
 #include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #include <linux/of.h>
 #include "hw.h"
 #include "../pwrseqcmd.h"
@@ -40,12 +41,15 @@ static bool op2200h_allow_tx;
 module_param(op2200h_allow_tx, bool, 0600);
 MODULE_PARM_DESC(op2200h_allow_tx, "Permit OP2200H RTL8192F hardware init/transmit (default: false)");
 
-/* R13/R14: first HIMR write starts a level-INTx storm.  Cap IRQ re-enables
- * so the UART can come back instead of spinning in _rtl_pci_interrupt. */
-#define OP2200H_IRQ_STORM_BUDGET	32
+/* R15 showed 32 IRQs in ~1.6s is BCNDMAINT0 (~20 Hz), not a tight storm.
+ * Halt only if the line is stuck: more than this many enable_interrupt
+ * calls inside one 100 ms window. */
+#define OP2200H_IRQ_STORM_BUDGET	200
+#define OP2200H_IRQ_STORM_WINDOW	(HZ / 10)
 static bool op2200h_himr_logged;
 static bool op2200h_irq_halted;
 static unsigned int op2200h_irq_events;
+static unsigned long op2200h_irq_window_start;
 
 /* R8 hung after "card disable begin" with the 2.4 GHz LED still on, so the
  * stall is inside rtl92fe_card_disable() / _rtl92fe_poweroff_adapter() and
@@ -1442,6 +1446,7 @@ int rtl92fe_hw_init(struct ieee80211_hw *hw)
 		if (op2200h_irq_halted)
 			enable_irq(rtlpci->pdev->irq);
 		op2200h_irq_events = 0;
+		op2200h_irq_window_start = jiffies;
 		op2200h_irq_halted = false;
 		op2200h_himr_logged = false;
 		pr_warn("rtl8192fe: OP2200H TX EXPLICITLY UNLOCKED for this RAM boot\n");
@@ -1686,11 +1691,14 @@ int rtl92fe_hw_init(struct ieee80211_hw *hw)
 		(u32)rtlphy->reg_e94, (u32)rtlphy->reg_e9c,
 		(u32)rtlphy->reg_eb4, (u32)rtlphy->reg_ebc);
 
-	/* STA bring-up must not leave beacon DMA armed: R13 ISR stuck at
-	 * BCNDMAINT0 (bit 20), which is not in irq_mask[0], and the pin
-	 * stayed asserted. */
-	if (of_machine_is_compatible("ovt,op2200h"))
+	/* STA bring-up must not leave beacon DMA armed: R13/R15 ISR bit 20
+	 * (BCNDMAINT0) ticks at ~20 Hz even after stop_tx_beacon because
+	 * hw_init programs BCN_CTRL 0x1d (EN_BCN_FUNCTION).  Clear that
+	 * until AP mode; RX of 802.11 beacons does not use this bit. */
+	if (of_machine_is_compatible("ovt,op2200h")) {
 		_rtl92fe_stop_tx_beacon(hw);
+		_rtl92fe_set_bcn_ctrl_reg(hw, 0, EN_BCN_FUNCTION);
+	}
 
 	rtl_dbg(rtlpriv, COMP_INIT, DBG_LOUD,
 		"end of Rtl8192FE hw init %x\n", err);
@@ -1874,6 +1882,11 @@ void rtl92fe_enable_interrupt(struct ieee80211_hw *hw)
 		if (op2200h_irq_halted)
 			return;
 
+		if (time_after(jiffies,
+			       op2200h_irq_window_start + OP2200H_IRQ_STORM_WINDOW)) {
+			op2200h_irq_window_start = jiffies;
+			op2200h_irq_events = 0;
+		}
 		op2200h_irq_events++;
 		if (op2200h_irq_events > OP2200H_IRQ_STORM_BUDGET) {
 			op2200h_irq_halted = true;

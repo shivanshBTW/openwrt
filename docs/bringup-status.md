@@ -582,8 +582,27 @@ R15 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,280,137
 bytes and payload 4,280,073 bytes.
 
 ```text
-bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-r15-initramfs-kernel.bin
 SHA256 1b24db73b45adcc60de2f3e7c631f35dea1066a51eb12c4c152b174f46f14243
+```
+
+R15 `wlan0 up` returned. Mapping is Linux IRQ 15 / `MIPS GIC 57` (the stock
+`/proc` line). First HIMR write: ISR cleared to 0, then immediately
+ISR=`0x00100000` (BCNDMAINT0). ~1.6 s later the 32-event budget fired with
+ISR/HISRE already 0 and count 32. That is a ~20 Hz beacon tick, not a tight
+storm; R13 looked hung because it printed on every IRQ. Shutdown still
+completed. Do not unlock R15 again.
+
+R16 keeps IRQs armed: storm halt is 200 events in 100 ms, and `EN_BCN_FUNCTION`
+is cleared after PHY init so BCNDMAINT0 should stop. Do not scan until idle
+IRQ 15 is stable across a few seconds.
+
+R16 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,280,312
+bytes and payload 4,280,248 bytes.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 474f57f2396e7fda064e6962f057033214793ca092a2c485e2813c3720c26719
 ```
 
 R13 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,341
