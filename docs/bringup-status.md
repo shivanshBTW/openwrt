@@ -635,6 +635,11 @@ bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie
 SHA256 d63e1c56abc503aa202af94cb6a77ccb91e6ae2c785ae165aee239e7e8a9b764
 ```
 
+R17 passive scan: BSS signals were negative and not identical (about −24 dBm on a
+close AP, −74…−78 dBm on others). Jaguar2 PWDB parse is good enough for STA
+work. Shutdown completed; TX gate relocked. Do not start AP or associate
+without an explicit next experiment (needs a network the operator controls).
+
 R13 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,341
 bytes and payload 4,279,277 bytes.
 
