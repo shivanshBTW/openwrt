@@ -63,6 +63,12 @@
 #include <linux/types.h>
 
 #include <asm/addrspace.h>
+#include <dt-bindings/interrupt-controller/mips-gic.h>
+
+/* This kernel's MIPS GIC has seven local slots; shared input N is domain
+ * hwirq 7+N. Do not include asm/mips-gic.h here -- its register accessors
+ * fight pci.h. UART <GIC_SHARED 23> appearing as MIPS GIC 30 confirms 7. */
+#define LUNA_GIC_NUM_LOCAL_INTRS	7
 
 /* SoC system controller registers (KSEG1, uncached). Present on BOTH chips
  * except where the table says otherwise -- see SOC_PINMUX. */
@@ -448,13 +454,13 @@ int pcibios_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 	/* The endpoint's INTx is aggregated by the SoC INTC onto a single input
 	 * line. One-cell Luna INTCs keep irq_create_of_mapping().
 	 *
-	 * RTL9607C / mti,gic: R7 used <GIC_SHARED input LEVEL_HIGH>, which
-	 * xlate to domain hwirq (7 + input) = 64 for input 57. R11 showed the
-	 * RTL8192F ISR with ROK pending (0x00100001) while Linux IRQ 15 /
-	 * MIPS GIC 64 stayed at count 0. R6's irq_create_mapping(domain, 57)
-	 * is the line that actually delivered INTx (it stormed only because
-	 * the descriptor kept handle_bad_irq). Map that hwirq and force
-	 * LEVEL_HIGH so the GIC level handler can ack it. */
+	 * RTL9607C: R11 of_mapping <GIC_SHARED 57> produced hwirq 64, which
+	 * never fired while the endpoint ISR showed ROK pending. R12
+	 * irq_create_mapping(57) hung on wlan0 up after PHY init (HIMR enable
+	 * never logged) -- that is the live line, but create_mapping skipped
+	 * GIC alloc so the level handler could not ack. R13 uses of_mapping
+	 * with shared input (hwirq - GIC_NUM_LOCAL_INTRS) so domain hwirq 57
+	 * gets a real GIC descriptor. */
 	if (!host || !host->chip)
 		return 0;
 	chip = host->chip;
@@ -472,15 +478,15 @@ int pcibios_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 					oirq.args[0] = chip->hwirq;
 					host->virq = irq_create_of_mapping(&oirq);
 				} else if (cells == 3) {
-					struct irq_domain *domain = irq_find_host(np);
+					unsigned int shared = chip->hwirq;
 
-					if (domain) {
-						host->virq = irq_create_mapping(domain,
-										chip->hwirq);
-						if (host->virq)
-							irq_set_irq_type(host->virq,
-									 IRQ_TYPE_LEVEL_HIGH);
-					}
+					if (shared >= LUNA_GIC_NUM_LOCAL_INTRS)
+						shared -= LUNA_GIC_NUM_LOCAL_INTRS;
+					oirq.args_count = 3;
+					oirq.args[0] = GIC_SHARED;
+					oirq.args[1] = shared;
+					oirq.args[2] = IRQ_TYPE_LEVEL_HIGH;
+					host->virq = irq_create_of_mapping(&oirq);
 				}
 			}
 			of_node_put(np);

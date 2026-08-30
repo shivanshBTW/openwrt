@@ -1844,16 +1844,23 @@ void rtl92fe_enable_interrupt(struct ieee80211_hw *hw)
 {
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
+	static bool op2200h_himr_logged;
 
 	rtl_write_dword(rtlpriv, REG_HIMR, rtlpci->irq_mask[0] & 0xFFFFFFFF);
 	rtl_write_dword(rtlpriv, REG_HIMRE, rtlpci->irq_mask[1] & 0xFFFFFFFF);
 	rtlpci->irq_enabled = true;
-	if (of_machine_is_compatible("ovt,op2200h"))
+
+	/* Do not print on the IRQ-reenable path: _rtl_pci_interrupt calls
+	 * this after every event. R13 flooded the console and looked like a
+	 * hang. */
+	if (of_machine_is_compatible("ovt,op2200h") && !op2200h_himr_logged) {
+		op2200h_himr_logged = true;
 		pr_info("rtl8192fe: OP2200H HIMR=0x%08x ISR=0x%08x HIMRE=0x%08x irq=%u msi=%d\n",
 			rtl_read_dword(rtlpriv, REG_HIMR),
 			rtl_read_dword(rtlpriv, ISR),
 			rtl_read_dword(rtlpriv, REG_HIMRE),
 			rtlpci->pdev->irq, rtlpci->using_msi);
+	}
 }
 
 void rtl92fe_disable_interrupt(struct ieee80211_hw *hw)
@@ -1975,12 +1982,17 @@ void rtl92fe_interrupt_recognized(struct ieee80211_hw *hw,
 {
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
+	u32 isr, hisr;
 
-	intvec->inta = rtl_read_dword(rtlpriv, ISR) & rtlpci->irq_mask[0];
-	rtl_write_dword(rtlpriv, ISR, intvec->inta);
-
-	intvec->intb = rtl_read_dword(rtlpriv, REG_HISRE) & rtlpci->irq_mask[1];
-	rtl_write_dword(rtlpriv, REG_HISRE, intvec->intb);
+	/* Ack every latched bit, not only irq_mask. R13 left ISR bit 20
+	 * (BCNDMAINT0) pending because it is not in irq_mask[0]; the endpoint
+	 * kept INTx asserted and _rtl_pci_interrupt retriggered forever. */
+	isr = rtl_read_dword(rtlpriv, ISR);
+	hisr = rtl_read_dword(rtlpriv, REG_HISRE);
+	rtl_write_dword(rtlpriv, ISR, isr);
+	rtl_write_dword(rtlpriv, REG_HISRE, hisr);
+	intvec->inta = isr & rtlpci->irq_mask[0];
+	intvec->intb = hisr & rtlpci->irq_mask[1];
 }
 
 void rtl92fe_set_beacon_related_registers(struct ieee80211_hw *hw)

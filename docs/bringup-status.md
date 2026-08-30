@@ -545,6 +545,39 @@ bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie
 SHA256 1a746f87f428fd324701a27b943904d9d5deb9772239d9d9a4a767c3f6c0ffa2
 ```
 
+R12 locked boot mapped `INTx input 57` to Linux IRQ 57 / hwirq 57. `wlan0 up`
+printed RF/PHY then hung; `enabling HIMR` never appeared. That is the R6 line
+firing when IMR is unmasked, with `irq_create_mapping()` still not giving the
+GIC a proper EOI path. Do not unlock R12 again.
+
+R13 uses `irq_create_of_mapping(<GIC_SHARED, hwirq-7, LEVEL_HIGH>)` so domain
+hwirq 57 is allocated by the GIC (shared input 50). A print runs *before* the
+HIMR write so a hang still shows whether we reached interrupt enable.
+
+R13 mapped Linux IRQ 15 / hwirq 57. `wlan0 up` reached `enabling HIMR` and
+HIMR=`0x200004ff`, then looped that print from `_rtl_pci_interrupt`'s
+re-enable. ISR stayed `0x00100000` (BCNDMAINT0, not in `irq_mask[0]`), so
+INTx never deasserted. That is a working GIC path plus an ack bug, not a
+mapping miss. Do not unlock R13 again.
+
+R14 acks the full ISR/HISRE and prints HIMR only once.
+
+R14 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,401
+bytes and payload 4,279,337 bytes.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 23de5a5cb6c45286d761ab70af21bf05afd680c6efcf650c8a7150272707c582
+```
+
+R13 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,341
+bytes and payload 4,279,277 bytes.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 5404fc8c0d17fcb9bbea96b3286e78f89a7f7b541cbcafc6c1e904daf10189f6
+```
+
 ```text
 bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
 SHA256 5212e05234691f0fb5cf9517bf277eb019fcbd2d9af2565c2a9e20af2f6ad82f
