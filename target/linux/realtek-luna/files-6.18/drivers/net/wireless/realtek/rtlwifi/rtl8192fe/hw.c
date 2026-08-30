@@ -2132,6 +2132,21 @@ void rtl92fe_update_interrupt_mask(struct ieee80211_hw *hw,
 		rtlpci->irq_mask[0] |= add_msr;
 	if (rm_msr)
 		rtlpci->irq_mask[0] &= (~rm_msr);
+
+	/* R18 hung after EN_BCN_FUNCTION: core.c unmasks BCNDMAINT0, and
+	 * _rtl_pci_interrupt then tasklet-refills the beacon on every
+	 * tick.  On this one-core INTx host that livelocks.  Keep the
+	 * one-shot send_beacon_frame() download; HW will repeat the
+	 * beacon queue without the SW tasklet. */
+	if (of_machine_is_compatible("ovt,op2200h")) {
+		u32 bcn = IMR_BCNDMAINT0 | IMR_TBDOK | IMR_TBDER;
+
+		if (rtlpci->irq_mask[0] & bcn) {
+			rtlpci->irq_mask[0] &= ~bcn;
+			pr_info("rtl8192fe: OP2200H leaving BCNDMAINT0 masked (no SW beacon tasklet)\n");
+		}
+	}
+
 	rtl92fe_disable_interrupt(hw);
 	rtl92fe_enable_interrupt(hw);
 }
