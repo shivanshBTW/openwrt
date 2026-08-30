@@ -15,6 +15,7 @@
 #include "fw.h"
 #include "led.h"
 #include <linux/delay.h>
+#include <linux/interrupt.h>
 #include <linux/of.h>
 #include "hw.h"
 #include "../pwrseqcmd.h"
@@ -38,6 +39,13 @@ MODULE_PARM_DESC(xtal_cap, "RTL8192F crystal load-cap trim 0..0x3f (<0 = use EFU
 static bool op2200h_allow_tx;
 module_param(op2200h_allow_tx, bool, 0600);
 MODULE_PARM_DESC(op2200h_allow_tx, "Permit OP2200H RTL8192F hardware init/transmit (default: false)");
+
+/* R13/R14: first HIMR write starts a level-INTx storm.  Cap IRQ re-enables
+ * so the UART can come back instead of spinning in _rtl_pci_interrupt. */
+#define OP2200H_IRQ_STORM_BUDGET	32
+static bool op2200h_himr_logged;
+static bool op2200h_irq_halted;
+static unsigned int op2200h_irq_events;
 
 /* R8 hung after "card disable begin" with the 2.4 GHz LED still on, so the
  * stall is inside rtl92fe_card_disable() / _rtl92fe_poweroff_adapter() and
@@ -1428,8 +1436,16 @@ int rtl92fe_hw_init(struct ieee80211_hw *hw)
 		pr_err("rtl8192fe: OP2200H TX LOCKED: set the root-only op2200h_allow_tx parameter explicitly before a controlled radio test\n");
 		return 1;
 	}
-	if (of_machine_is_compatible("ovt,op2200h"))
+	if (of_machine_is_compatible("ovt,op2200h")) {
+		struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
+
+		if (op2200h_irq_halted)
+			enable_irq(rtlpci->pdev->irq);
+		op2200h_irq_events = 0;
+		op2200h_irq_halted = false;
+		op2200h_himr_logged = false;
 		pr_warn("rtl8192fe: OP2200H TX EXPLICITLY UNLOCKED for this RAM boot\n");
+	}
 
 	rtl_dbg(rtlpriv, COMP_INIT, DBG_LOUD, " Rtl8192FE hw init\n");
 	rtlpriv->rtlhal.being_init_adapter = true;
@@ -1670,6 +1686,12 @@ int rtl92fe_hw_init(struct ieee80211_hw *hw)
 		(u32)rtlphy->reg_e94, (u32)rtlphy->reg_e9c,
 		(u32)rtlphy->reg_eb4, (u32)rtlphy->reg_ebc);
 
+	/* STA bring-up must not leave beacon DMA armed: R13 ISR stuck at
+	 * BCNDMAINT0 (bit 20), which is not in irq_mask[0], and the pin
+	 * stayed asserted. */
+	if (of_machine_is_compatible("ovt,op2200h"))
+		_rtl92fe_stop_tx_beacon(hw);
+
 	rtl_dbg(rtlpriv, COMP_INIT, DBG_LOUD,
 		"end of Rtl8192FE hw init %x\n", err);
 	return 0;
@@ -1844,23 +1866,59 @@ void rtl92fe_enable_interrupt(struct ieee80211_hw *hw)
 {
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-	static bool op2200h_himr_logged;
+	bool op2200h = of_machine_is_compatible("ovt,op2200h");
+
+	if (op2200h) {
+		bool first_enable;
+
+		if (op2200h_irq_halted)
+			return;
+
+		op2200h_irq_events++;
+		if (op2200h_irq_events > OP2200H_IRQ_STORM_BUDGET) {
+			op2200h_irq_halted = true;
+			rtl_write_dword(rtlpriv, REG_HIMR, IMR_DISABLED);
+			rtl_write_dword(rtlpriv, REG_HIMRE, IMR_DISABLED);
+			rtlpci->irq_enabled = false;
+			pr_err("rtl8192fe: OP2200H IRQ storm (%u events) ISR=0x%08x HISRE=0x%08x; HIMR left 0, masking GIC irq=%u\n",
+			       op2200h_irq_events,
+			       rtl_read_dword(rtlpriv, ISR),
+			       rtl_read_dword(rtlpriv, REG_HISRE),
+			       rtlpci->pdev->irq);
+			disable_irq_nosync(rtlpci->pdev->irq);
+			return;
+		}
+
+		/* Print *before* the HIMR write: R14 hung in the storm so the
+		 * post-write one-shot never reached UART.  W1C every ISR bit
+		 * so INTx can drop before the mask is applied.  Mark logged
+		 * immediately so a re-enter from the IRQ path cannot flood. */
+		first_enable = !op2200h_himr_logged;
+		if (first_enable) {
+			rtl_write_dword(rtlpriv, ISR, 0xffffffff);
+			rtl_write_dword(rtlpriv, REG_HISRE, 0xffffffff);
+			pr_info("rtl8192fe: OP2200H ISR cleared to 0x%08x, enabling HIMR irq=%u mask=0x%08x\n",
+				rtl_read_dword(rtlpriv, ISR),
+				rtlpci->pdev->irq, rtlpci->irq_mask[0]);
+			op2200h_himr_logged = true;
+		}
+
+		rtl_write_dword(rtlpriv, REG_HIMR, rtlpci->irq_mask[0] & 0xFFFFFFFF);
+		rtl_write_dword(rtlpriv, REG_HIMRE, rtlpci->irq_mask[1] & 0xFFFFFFFF);
+		rtlpci->irq_enabled = true;
+
+		if (first_enable)
+			pr_info("rtl8192fe: OP2200H HIMR=0x%08x ISR=0x%08x HIMRE=0x%08x irq=%u msi=%d\n",
+				rtl_read_dword(rtlpriv, REG_HIMR),
+				rtl_read_dword(rtlpriv, ISR),
+				rtl_read_dword(rtlpriv, REG_HIMRE),
+				rtlpci->pdev->irq, rtlpci->using_msi);
+		return;
+	}
 
 	rtl_write_dword(rtlpriv, REG_HIMR, rtlpci->irq_mask[0] & 0xFFFFFFFF);
 	rtl_write_dword(rtlpriv, REG_HIMRE, rtlpci->irq_mask[1] & 0xFFFFFFFF);
 	rtlpci->irq_enabled = true;
-
-	/* Do not print on the IRQ-reenable path: _rtl_pci_interrupt calls
-	 * this after every event. R13 flooded the console and looked like a
-	 * hang. */
-	if (of_machine_is_compatible("ovt,op2200h") && !op2200h_himr_logged) {
-		op2200h_himr_logged = true;
-		pr_info("rtl8192fe: OP2200H HIMR=0x%08x ISR=0x%08x HIMRE=0x%08x irq=%u msi=%d\n",
-			rtl_read_dword(rtlpriv, REG_HIMR),
-			rtl_read_dword(rtlpriv, ISR),
-			rtl_read_dword(rtlpriv, REG_HIMRE),
-			rtlpci->pdev->irq, rtlpci->using_msi);
-	}
 }
 
 void rtl92fe_disable_interrupt(struct ieee80211_hw *hw)
@@ -1986,11 +2044,13 @@ void rtl92fe_interrupt_recognized(struct ieee80211_hw *hw,
 
 	/* Ack every latched bit, not only irq_mask. R13 left ISR bit 20
 	 * (BCNDMAINT0) pending because it is not in irq_mask[0]; the endpoint
-	 * kept INTx asserted and _rtl_pci_interrupt retriggered forever. */
+	 * kept INTx asserted and _rtl_pci_interrupt retriggered forever.
+	 * Write 0xffffffff in case this HISR is W1C of any bit, not only
+	 * bits that were sampled. */
 	isr = rtl_read_dword(rtlpriv, ISR);
 	hisr = rtl_read_dword(rtlpriv, REG_HISRE);
-	rtl_write_dword(rtlpriv, ISR, isr);
-	rtl_write_dword(rtlpriv, REG_HISRE, hisr);
+	rtl_write_dword(rtlpriv, ISR, 0xffffffff);
+	rtl_write_dword(rtlpriv, REG_HISRE, 0xffffffff);
 	intvec->inta = isr & rtlpci->irq_mask[0];
 	intvec->intb = hisr & rtlpci->irq_mask[1];
 }

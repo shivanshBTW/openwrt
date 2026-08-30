@@ -10,6 +10,7 @@
 #include <linux/interrupt.h>
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/of.h>
 
 MODULE_AUTHOR("lizhaoming	<chaoming_li@realsil.com.cn>");
 MODULE_AUTHOR("Realtek WlanFAE	<wlanfae@realtek.com>");
@@ -1726,10 +1727,16 @@ static int rtl_pci_start(struct ieee80211_hw *hw)
 	rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_RETRY_LIMIT,
 			&rtlmac->retry_long);
 
+	/* RX rings must be programmed before HIMR unmasks ROK.  Stock order
+	 * enabled interrupts first; on OP2200H that races the first INTx. */
+	if (of_machine_is_compatible("ovt,op2200h"))
+		pr_info("rtl_pci: OP2200H hw_init done, RX config then HIMR\n");
+	rtl_init_rx_config(hw);
+	if (of_machine_is_compatible("ovt,op2200h"))
+		pr_info("rtl_pci: OP2200H RX config done, enabling interrupts\n");
+
 	rtlpriv->cfg->ops->enable_interrupt(hw);
 	rtl_dbg(rtlpriv, COMP_INIT, DBG_LOUD, "enable_interrupt OK\n");
-
-	rtl_init_rx_config(hw);
 
 	/*should be after adapter start and interrupt enable. */
 	set_hal_start(rtlhal);

@@ -566,8 +566,24 @@ R14 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,401
 bytes and payload 4,279,337 bytes.
 
 ```text
-bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-r14-initramfs-kernel.bin
 SHA256 23de5a5cb6c45286d761ab70af21bf05afd680c6efcf650c8a7150272707c582
+```
+
+R14 hung after `PHY op` with no HIMR line. The storm starts on the first HIMR
+write, before the post-write printk can drain. Do not unlock R14 again.
+
+R15 clears ISR/HISRE with `0xffffffff` before unmasking, programs RX rings
+before HIMR, prints *before* the HIMR write, stops beacon DMA on OP2200H STA
+init, and after 32 IRQ re-enables leaves HIMR=0 and `disable_irq_nosync` so
+the UART can return. Do not scan.
+
+R15 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,280,137
+bytes and payload 4,280,073 bytes.
+
+```text
+bin/targets/realtek-luna/rtl9607x/openwrt-realtek-luna-rtl9607x-ovt_op2200h_pcie_test-initramfs-kernel.bin
+SHA256 1b24db73b45adcc60de2f3e7c631f35dea1066a51eb12c4c152b174f46f14243
 ```
 
 R13 built on 2026-08-30 as a legacy MIPS/LZMA uImage, total size 4,279,341
